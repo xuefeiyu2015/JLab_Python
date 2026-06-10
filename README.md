@@ -1,14 +1,15 @@
-# jlab
+# Python Package:  jlab
 
 Python package for loading and exporting Blackrock NEV/NSx data from JLab experiments.
-Replicates the output of `BackRockFileLoader.m` — produces identical `.txt` and `.csv` files.
+Replicates the output of `BackRockFileLoader.m`[Matlab Version](https://github.com/xuefeiyu2015/JLab) — produces identical `.txt` and `.csv` files.
 
 ## What it does
 
-- Reads a Blackrock `.nev` file and parses behavioral trial event comments
+- Reads a Blackrock `.nev` file file and parses behavioral trial event comments into trial based structure
+- Reads a Blackrock `.ns2` file file and parses eye data into trial based structure (under construction)
 - Exports `Blackrock_YYYY-MM-DD_expmeta.txt` — experiment metadata (one key: value per line)
 - Exports `Blackrock_YYYY-MM-DD_trials.csv` — per-trial behavioral data with derived features
-- Optionally loads a `.ns2` analog file (eye tracking) and exports it to `Blackrock_YYYY-MM-DD_analog.csv`
+- Optionally loads a `.ns2` analog file (eye tracking) and exports it to `Blackrock_YYYY-MM-DD_analog.csv`(under construction)
 
 ## Requirements
 
@@ -137,10 +138,10 @@ One row per trial. Key columns:
 | `Choose_target` | Which target was chosen (1 or 2) |
 | `Choose_leftright` | 1 = rightward, −1 = leftward |
 
-### `_analog.csv`
+### `_analog.csv` (under construction)
 One row per sample, columns named `channel_1`, `channel_2`, etc. (electrode IDs from the NSx file).
 
-## Step-by-step API
+## Step-by-step API (if you want to do some basic analysis directly after exporting)
 
 ```python
 from jlab import BlackRockLoader
