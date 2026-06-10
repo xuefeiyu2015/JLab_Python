@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Package build artifacts
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# uv
+.python-version
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Blackrock data files (large, should not be committed)
+*.nev
+*.ns1
+*.ns2
+*.ns3
+*.ns4
+*.ns5
+*.ns6
