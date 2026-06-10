@@ -58,8 +58,14 @@ class BlackRockLoader:
         verbose: bool = True,
     ) -> None:
         self.nev_path = Path(nev_path)
+        if not self.nev_path.exists():
+            raise FileNotFoundError(f"NEV file not found: {self.nev_path}")
+
         self.output_dir = Path(output_dir) if output_dir else self.nev_path.parent
         self.ns_path = Path(ns_path) if ns_path else None
+        if self.ns_path is not None and not self.ns_path.exists():
+            raise FileNotFoundError(f"NS file not found: {self.ns_path}")
+
         self.verbose = verbose
         self.date_str = date_str
 
