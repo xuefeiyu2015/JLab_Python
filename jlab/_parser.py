@@ -115,9 +115,15 @@ def _handle_exp_event(text: str, time_s: float, exp: dict) -> None:
         return
     marker, payload = m.group(1), m.group(2).strip()
 
-    # Record start/end timestamp
-    if _is_nan(exp[marker]):
-        exp[marker] = time_s
+    # Record start/end timestamp. A recording can contain multiple experiment
+    # runs (e.g. an aborted start, then the real session). Keep the EARLIEST
+    # start and the LATEST end so the session spans the whole recording instead
+    # of collapsing onto the first (possibly aborted) run.
+    if marker == "start":
+        if _is_nan(exp["start"]):
+            exp["start"] = time_s
+    else:  # marker == "end"
+        exp["end"] = time_s
 
     # Parse payload into metadata fields
     if payload.startswith("git commit"):
@@ -314,7 +320,7 @@ def parse_comments(
     """
     experiment = _make_empty_experiment()
     trials: list[dict] = []
-    trial_num_to_idx: dict[int, int] = {}
+    prev_trial_num: int | None = None
 
     for text, time_s in zip(comments, times_s):
         text = text.strip()
@@ -334,14 +340,17 @@ def parse_comments(
         trial_num = int(m.group(1))
         event_text = m.group(2).strip()
 
-        # Find or create the trial
-        if trial_num not in trial_num_to_idx:
+        # A new trial begins whenever the parsed trial number changes from the
+        # previous trial event. Trials are keyed by POSITION, not by number, so
+        # a reset/non-monotonic counter (e.g. ...30, 0, 1...) starts a new trial
+        # instead of merging into an earlier same-numbered trial.
+        if not trials or trial_num != prev_trial_num:
             t = _make_empty_trial()
             t["Trial_number"] = trial_num
             trials.append(t)
-            trial_num_to_idx[trial_num] = len(trials) - 1
+        prev_trial_num = trial_num
 
-        trial = trials[trial_num_to_idx[trial_num]]
+        trial = trials[-1]
 
         _dispatch_trial_event(event_text, time_s, trial)
 

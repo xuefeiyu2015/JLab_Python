@@ -17,7 +17,9 @@ from ._parser import _make_empty_trial
 
 def _build_column_order() -> list[str]:
     """Derive CSV column order from the trial template + derived feature names."""
-    columns: list[str] = []
+    # Explicit 0-based sequential row index (pandas-friendly: read_csv(index_col='index')).
+    # Kept separate from Trial_number, which holds the real (resetting) trial number.
+    columns: list[str] = ["index"]
     for field in _make_empty_trial():
         if field in ("undefined", "duplicates"):
             continue
@@ -102,8 +104,8 @@ def write_trials_csv(trials: list[dict], path: Path) -> None:
 
     # Flatten each trial: expand coord fields, drop internal lists
     rows = []
-    for trial in trials:
-        row: dict[str, str] = {}
+    for i, trial in enumerate(trials):
+        row: dict[str, str] = {"index": str(i)}
         for field, val in trial.items():
             if field in ("undefined", "duplicates"):
                 continue
