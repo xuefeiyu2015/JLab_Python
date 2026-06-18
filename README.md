@@ -3,7 +3,7 @@
 Python package for loading and exporting Blackrock NEV/NSx data from JLab experiments.
 Replicates the output of `BackRockFileLoader.m`[Matlab Version](https://github.com/xuefeiyu2015/JLab) — produces identical `.txt` and `.csv` files.
 
-Last update: Xuefei Yu, 06-09-2026
+Last update: Xuefei Yu, 06-18-2026
 
 
 ## What it does
@@ -62,16 +62,77 @@ uv pip install -e .
 
 That's it. `brpylib` is bundled in this repo — no separate install needed.
 
+## Setting up your data path
+
+Loading is **folder-based** — you don't pass individual filenames. The loader
+mirrors the MATLAB workflow: point it at a *session folder* and a *date*, and it
+auto-detects the raw files and writes the exports.
+
+Your data must be laid out like this:
+
+```
+<Basic_Path>/
+└── <Monkey>/
+    └── <Location>/                 ← this is the "session path"
+        ├── raw_data/
+        │   └── <Date>/             ← e.g. 2026-06-17
+        │       ├── *.nev           ← behavioral events (largest is auto-picked)
+        │       └── *.ns2           ← optional analog / eye tracking
+        └── export_data/            ← created automatically
+            └── <Date>/
+                ├── Blackrock_<Date>_expmeta.txt
+                ├── Blackrock_<Date>_trials.csv
+                └── Blackrock_<Date>_analog.csv
+```
+
+Build the **session path** from your own folder structure, then pass it with the
+date:
+
+```python
+from pathlib import Path
+from jlab import BlackRockLoader
+
+# ── Edit these for your machine ─────────────────────────────────────────────
+Basic_Path = "/path/to/your/Data"   # root data folder
+Monkey     = "Monkey Porthos"
+Location   = "in_lab"
+Date       = "2026-06-17"           # the raw_data/<Date> sub-folder
+# ────────────────────────────────────────────────────────────────────────────
+
+Session_Path = Path(Basic_Path) / Monkey / Location
+
+# The loader reads from  Session_Path/raw_data/<Date>
+# and writes to          Session_Path/export_data/<Date>
+```
+
+Defaults you can override in the constructor:
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `data_type` | `"raw_data"` | name of the raw-data sub-folder |
+| `output_folder` | `"export_data"` | name of the export sub-folder |
+| `ns_marker` | `"ns2"` | NSx analog extension (use `"ns6"` etc. for other rates) |
+| `nev_filename` | auto | pick a specific `.nev` instead of the largest |
+| `ns_filename` | auto | pick a specific NSx file instead of the largest |
+
 ## Quick start
 
 ```python
 from pathlib import Path
 from jlab import BlackRockLoader
 
+Session_Path = Path("/path/to/your/Data") / "Monkey Porthos" / "in_lab"
+Date = "2026-06-17"
+
+# Peek at the .nev files in the folder (largest first) — optional
+BlackRockLoader.list_nev_files(Session_Path, Date)
+
 loader = BlackRockLoader(
-    nev_path="path/to/file.nev",
-    output_dir="path/to/output/",   # optional — defaults to same folder as .nev
-    ns_path="path/to/file.ns2",     # optional — omit if no eye tracking
+    Session_Path, Date,
+    load_analog=True,        # also auto-detect the NSx analog (eye-tracking) file
+    # nev_filename="...",    # optional: pick a specific .nev (else the largest)
+    # ns_marker="ns2",       # NSx extension to load; default "ns2", e.g. "ns6"
+    # ns_filename="...",     # optional: pick a specific NSx file
 )
 
 output_dir, files = loader.run()
@@ -83,16 +144,19 @@ for f in files:
 
 Output:
 ```
-Loading NEV: file.nev
+NEV file      : Hub1-Porthos_20260617.nev
+Analog file   : Hub1-Porthos_20260617.ns2
+Output dir    : /path/to/your/Data/Monkey Porthos/in_lab/export_data/2026-06-17
+Loading NEV: Hub1-Porthos_20260617.nev
   210 events found
   68 trials parsed (68 complete)
-Loading analog: file.ns2
+Loading analog: Hub1-Porthos_20260617.ns2
   3 channels, 1 segment(s), 279280 samples, 1000.0 Hz
 
-Output folder: path/to/output
-  Blackrock_2026-03-24_expmeta.txt
-  Blackrock_2026-03-24_trials.csv
-  Blackrock_2026-03-24_analog.csv
+Output folder: /path/to/your/Data/Monkey Porthos/in_lab/export_data/2026-06-17
+  Blackrock_2026-06-17_expmeta.txt
+  Blackrock_2026-06-17_trials.csv
+  Blackrock_2026-06-17_analog.csv
 ```
 
 ## Notebooks
@@ -147,9 +211,11 @@ One row per sample, columns named `channel_1`, `channel_2`, etc. (electrode IDs 
 ## Step-by-step API (if you want to do some basic analysis directly after exporting)
 
 ```python
+from pathlib import Path
 from jlab import BlackRockLoader
 
-loader = BlackRockLoader("file.nev", output_dir="output/", ns_path="file.ns2")
+Session_Path = Path("/path/to/your/Data") / "Monkey Porthos" / "in_lab"
+loader = BlackRockLoader(Session_Path, "2026-06-17", load_analog=True)
 
 # Step 1 — load and parse the NEV file
 loader.load_nev()
@@ -158,11 +224,12 @@ loader.load_nev()
 loader.export()
 
 # Step 3 — load and export analog (optional)
-loader.load_analog("file.ns2")
+# self.ns_path was auto-detected because load_analog=True was passed
+loader.load_analog(loader.ns_path)
 loader.export_analog()
 
 # Access parsed data directly
-loader.experiment   # dict of experiment metadata
+loader.experiments  # list of experiment-metadata dicts (one per session)
 loader.trials       # list of per-trial dicts
 loader.analog       # dict with 'data', 'elec_ids', 'samp_per_s'
 ```
