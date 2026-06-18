@@ -31,9 +31,9 @@ def _eccentricity(x: float, y: float) -> float:
 # Add new derived field names here when extending the function below.
 DERIVED_FIELDS: list[str] = [
     "Target_1_angle",
-    "Target_1_ecc",
+    "Target_1_eccentricity",
     "Target_2_angle",
-    "Target_2_ecc",
+    "Target_2_eccentricity",
     "Stimulus_direction",
     "Choose_target",
     "Choose_leftright",
@@ -42,7 +42,7 @@ DERIVED_FIELDS: list[str] = [
 
 def compute_derived_features(trials: list[dict]) -> None:
     """
-    Add Target_1/2_angle, Target_1/2_ecc, Stimulus_direction,
+    Add Target_1/2_angle, Target_1/2_eccentricity, Stimulus_direction,
     Choose_target, Choose_leftright to each trial dict.
     """
     for trial in trials:
@@ -59,8 +59,8 @@ def compute_derived_features(trials: list[dict]) -> None:
 
         trial["Target_1_angle"] = t1_angle
         trial["Target_2_angle"] = t2_angle
-        trial["Target_1_ecc"] = t1_ecc
-        trial["Target_2_ecc"] = t2_ecc
+        trial["Target_1_eccentricity"] = t1_ecc
+        trial["Target_2_eccentricity"] = t2_ecc
 
         # Stimulus direction: +1 if Target 1 is on the right (angle >= 0), -1 if left
         if not math.isnan(t1_angle):

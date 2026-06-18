@@ -1,5 +1,5 @@
 # Parameter map for jives comments
-# last updates: 06-09-2026 by Xuefei Yu
+# last updates: 06-18-2026 by Xuefei Yu
 import re
 
 # ── Experiment-level event map ─────────────────────────────────────────────
@@ -31,6 +31,10 @@ TIME_EVENTS: dict[str, str] = {
     "Target 1 acquired": "Choicetime",
     "Target 2 acquired": "Choicetime",
     "Target 1 off": "Target_1_off",
+    "Feedback flash on": "Feedback_flash_on",
+    "Feedback flash off": "Feedback_flash_off",
+    "Fixation exited": "Fixation_exited",
+    "Target deadline exceeded": "Target_deadline_exceeded",
 }
 
 SEGMENT_EVENTS: dict[str, str] = {
@@ -39,6 +43,7 @@ SEGMENT_EVENTS: dict[str, str] = {
     "Target 1 color": "Target_1_color",
     "Target 2 color": "Target_2_color",
     "Trial type": "Trial_type",
+    "Target 1 on the": "Target_1_side",
 }
 
 # Keys that match coordinate pattern "(x, y) deg" use coord regex.
@@ -67,6 +72,9 @@ INFORMATION_EVENTS: dict[str, str] = {
     "Reward start": "Reward_start",
     "Requested target dim opacity": "Requested_target_dim_opacity",
     "Requested target 1 visible duration": "Requested_target_1_visible_duration",
+    "Requested feedback flash duration": "Requested_feedback_flash_duration",
+    "Requested choice timeout": "Requested_choice_timeout",
+    "Requested target reach deadline": "Requested_target_reach_deadline",
 }
 
 DASH_EVENTS: list[str] = ["End", "Correct choice", "Wrong choice"]
@@ -82,6 +90,18 @@ RE_COORD = re.compile(
     r"^(.*?)\s*\(\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\)\s*deg$"
 )
 RE_REWARD = re.compile(r"^(.*?)\s*\(([\d\.]+)ms")
-RE_TIME_MS = re.compile(r"^(.*?)\s+([-+]?\d*\.?\d+)\s*ms$")
+# Value may be a number or 'None'/'none' (e.g. "... reach deadline None ms" → NaN)
+RE_TIME_MS = re.compile(r"^(.*?)\s+([-+]?\d*\.?\d+|None|none)\s*ms$")
 RE_SIZE_DEG = re.compile(r"^(.*?)\s+([-+]?\d*\.?\d+)\s*(?:deg)?$")
+
+# Offset-range event: "Requested time offset range [min, max] ms (active: [v1, v2, ...])"
+RE_OFFSET_RANGE = re.compile(
+    r"range\s*\[\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\]"
+)
+RE_OFFSET_ACTIVE = re.compile(r"active:\s*\[([^\]]*)\]")
+
+# Photodiode position coordinate "(x, y)" (no 'deg' suffix); used with .search()
+RE_PD_COORD = re.compile(
+    r"\(\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\)"
+)
 

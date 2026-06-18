@@ -14,6 +14,9 @@ from ._constants import (
     OUTCOME_EVENTS,
     RE_COORD,
     RE_EXP,
+    RE_OFFSET_ACTIVE,
+    RE_OFFSET_RANGE,
+    RE_PD_COORD,
     RE_REWARD,
     RE_SIZE_DEG,
     RE_TIME_MS,
@@ -26,6 +29,8 @@ NaN = float("nan")
 
 
 def _make_empty_experiment() -> dict:
+    # Field order mirrors the MATLAB exp_template (BackRockFileLoader.m).
+    # One of these dicts is created per experiment session within a recording.
     return {
         "git_commit": None,
         "viewing_distance": NaN,
@@ -34,14 +39,22 @@ def _make_empty_experiment() -> dict:
         "FPS": NaN,
         "eyetracker_rate": NaN,
         "eye_tracked": None,
+        "photodiode_circles": None,
+        "photodiode_fixation_position": [NaN, NaN],
+        "photodiode_target_1_position": [NaN, NaN],
+        "photodiode_target_2_position": [NaN, NaN],
         "start": NaN,
         "end": NaN,
+        "end_by": None,
     }
 
 
 def _make_empty_trial() -> dict:
+    # Field order mirrors the MATLAB trial struct (BackRockFileLoader.m); the CSV
+    # column order is derived from this, so keep it in sync with MATLAB.
     return {
         "Trial_number": NaN,
+        "Session": NaN,
         "Task": None,
         "Trial_type": None,
         "Start": NaN,
@@ -60,15 +73,15 @@ def _make_empty_trial() -> dict:
         "Requested_target_1_hold_time": NaN,
         "Requested_target_1_timeout": NaN,
         "Requested_target_1_duration": NaN,
+        "Target_2_position": [NaN, NaN],
+        "Target_2_size": NaN,
+        "Target_2_acceptance_window": NaN,
+        "Target_2_color": None,
         "Requested_target_2_time_offset": NaN,
         "Requested_target_2_hold_time": NaN,
         "Requested_penalty_box_duration": NaN,
         "Requested_target_dim_opacity": NaN,
         "Requested_target_1_visible_duration": NaN,
-        "Target_2_position": [NaN, NaN],
-        "Target_2_size": NaN,
-        "Target_2_acceptance_window": NaN,
-        "Target_2_color": None,
         "Fixation_point_on": NaN,
         "Fixation_acquired": NaN,
         "Fixation_point_off": NaN,
@@ -86,6 +99,18 @@ def _make_empty_trial() -> dict:
         "Reward_amount": NaN,
         "Reward_end": NaN,
         "Save_complete": 0,
+        # Newly added trial events (06-17-2026)
+        "Feedback_flash_on": NaN,
+        "Feedback_flash_off": NaN,
+        "Fixation_exited": NaN,
+        "Target_deadline_exceeded": NaN,
+        "Requested_feedback_flash_duration": NaN,
+        "Requested_choice_timeout": NaN,
+        "Requested_target_reach_deadline": NaN,
+        "Target_1_side": None,
+        "Requested_time_offset_min": NaN,
+        "Requested_time_offset_max": NaN,
+        "Requested_time_offset_active": None,
         "undefined": [],
         "duplicates": [],
     }
@@ -109,21 +134,21 @@ def _field_is_empty(trial: dict, field: str) -> bool:
 
 # ── Experiment event handler ───────────────────────────────────────────────
 
-def _handle_exp_event(text: str, time_s: float, exp: dict) -> None:
-    m = RE_EXP.match(text)
-    if not m:
-        return
-    marker, payload = m.group(1), m.group(2).strip()
+def _handle_exp_event(marker: str, payload: str, time_s: float, exp: dict) -> None:
+    """
+    Update a single session's metadata dict from one "Experiment start/end:" line.
 
-    # Record start/end timestamp. A recording can contain multiple experiment
-    # runs (e.g. an aborted start, then the real session). Keep the EARLIEST
-    # start and the LATEST end so the session spans the whole recording instead
-    # of collapsing onto the first (possibly aborted) run.
-    if marker == "start":
-        if _is_nan(exp["start"]):
-            exp["start"] = time_s
-    else:  # marker == "end"
-        exp["end"] = time_s
+    The session's `start` timestamp is stamped when the session is created (see
+    parse_comments); here we record the latest `end` (last end line wins), the
+    reason the session ended (`end_by`), and any metadata fields. Mirrors
+    BackRockFileLoader.m lines 295-339.
+    """
+    if marker == "end":
+        exp["end"] = time_s  # last end line wins
+        if not payload.startswith("git commit"):
+            # Capture why the session ended (e.g. 'experimenter closed task').
+            # The git-commit end line is just a commit re-stamp, not a reason.
+            exp["end_by"] = payload
 
     # Parse payload into metadata fields
     if payload.startswith("git commit"):
@@ -133,6 +158,23 @@ def _handle_exp_event(text: str, time_s: float, exp: dict) -> None:
     if payload.startswith("eyetracker tracking"):
         word = payload[len("eyetracker tracking"):].strip().split()[0]
         exp["eye_tracked"] = word
+        return
+
+    if payload.startswith("photodiode"):
+        # 'photodiode circles visible/hidden' or a '(x, y)' deg position.
+        coord = RE_PD_COORD.search(payload)
+        if payload.startswith("photodiode circles"):
+            exp["photodiode_circles"] = payload[len("photodiode circles"):].strip()
+        elif payload.startswith("photodiode fixation position") and coord:
+            exp["photodiode_fixation_position"] = [float(coord.group(1)), float(coord.group(2))]
+        elif payload.startswith("photodiode target_1 position") and coord:
+            exp["photodiode_target_1_position"] = [float(coord.group(1)), float(coord.group(2))]
+        elif payload.startswith("photodiode target_2 position") and coord:
+            exp["photodiode_target_2_position"] = [float(coord.group(1)), float(coord.group(2))]
+        return
+
+    if payload == "experimenter closed task":
+        # end-marker text, nothing to store
         return
 
     # Numeric: one or two numbers after the key name
@@ -206,7 +248,8 @@ def _handle_info_event(text: str, time_s: float, trial: dict) -> bool:
     # Try duration (ms) or size (deg)
     m = RE_TIME_MS.match(text) or RE_SIZE_DEG.match(text)
     if m:
-        dur = float(m.group(2))
+        raw = m.group(2)
+        dur = NaN if raw.lower() == "none" else float(raw)  # "None ms" → NaN
         if _is_nan(trial[field]):
             trial[field] = dur
         else:
@@ -279,6 +322,25 @@ def _handle_outcome_event(text: str, trial: dict) -> bool:
     return True
 
 
+def _handle_offset_range_event(text: str, trial: dict) -> bool:
+    """
+    Parse "Requested time offset range [min, max] ms (active: [v1, v2, ...])".
+    Range → two numeric fields; active list → a space-separated string (CSV
+    columns cannot hold multiple values). Mirrors BackRockFileLoader.m 579-592.
+    """
+    if "Requested time offset range" not in text:
+        return False
+    rng = RE_OFFSET_RANGE.search(text)
+    if rng:
+        trial["Requested_time_offset_min"] = float(rng.group(1))
+        trial["Requested_time_offset_max"] = float(rng.group(2))
+    active = RE_OFFSET_ACTIVE.search(text)
+    if active:
+        vals = [v.strip() for v in active.group(1).split(",") if v.strip()]
+        trial["Requested_time_offset_active"] = " ".join(vals)
+    return True
+
+
 def _dispatch_trial_event(text: str, time_s: float, trial: dict) -> None:
     if _handle_time_event(text, time_s, trial):
         return
@@ -290,6 +352,8 @@ def _dispatch_trial_event(text: str, time_s: float, trial: dict) -> None:
         return
     if _handle_outcome_event(text, trial):
         return
+    if _handle_offset_range_event(text, trial):
+        return
     # Truly undefined
     print(f"Undefined event detected: {text}")
     trial["undefined"].append(text)
@@ -300,9 +364,16 @@ def _dispatch_trial_event(text: str, time_s: float, trial: dict) -> None:
 def parse_comments(
     comments: list[str],
     times_s: list[float],
-) -> tuple[dict, list[dict]]:
+) -> tuple[list[dict], list[dict]]:
     """
-    Parse a flat list of NEV event comments into experiment metadata and trials.
+    Parse a flat list of NEV event comments into per-session experiment metadata
+    and trials.
+
+    A single recording can contain several experiment sessions (the task is
+    started/ended multiple times). Each "Experiment start: git commit ..." line
+    begins a new session, so `experiments` is a list with one dict per session,
+    and every trial records which session it belongs to (`Session`, 1-based; 0
+    if the trial precedes any session start).
 
     Parameters
     ----------
@@ -313,14 +384,16 @@ def parse_comments(
 
     Returns
     -------
-    experiment : dict
-        Experiment-level metadata fields.
+    experiments : list[dict]
+        Experiment-level metadata, one dict per session.
     trials : list[dict]
         One dict per trial, in order of first appearance.
     """
-    experiment = _make_empty_experiment()
+    experiments: list[dict] = []
     trials: list[dict] = []
+    session_index = 0  # 0 = no session started yet
     prev_trial_num: int | None = None
+    prev_session: int | None = None
 
     for text, time_s in zip(comments, times_s):
         text = text.strip()
@@ -328,8 +401,17 @@ def parse_comments(
             continue
 
         # ── Experiment-level event ─────────────────────────────────────────
-        if RE_EXP.match(text):
-            _handle_exp_event(text, time_s, experiment)
+        m = RE_EXP.match(text)
+        if m:
+            marker, payload = m.group(1), m.group(2).strip()
+            # A new session begins at each "Experiment start: git commit ..." line
+            # (the first line of every metadata block within the recording).
+            if marker == "start" and payload.startswith("git commit"):
+                session_index += 1
+                experiments.append(_make_empty_experiment())
+                experiments[-1]["start"] = time_s
+            if session_index >= 1:
+                _handle_exp_event(marker, payload, time_s, experiments[session_index - 1])
             continue
 
         # ── Trial-level event ──────────────────────────────────────────────
@@ -340,15 +422,18 @@ def parse_comments(
         trial_num = int(m.group(1))
         event_text = m.group(2).strip()
 
-        # A new trial begins whenever the parsed trial number changes from the
-        # previous trial event. Trials are keyed by POSITION, not by number, so
-        # a reset/non-monotonic counter (e.g. ...30, 0, 1...) starts a new trial
-        # instead of merging into an earlier same-numbered trial.
-        if not trials or trial_num != prev_trial_num:
+        # A new trial begins whenever the parsed trial number OR the session
+        # changes. Trials are keyed by POSITION, not by number, so a reset/
+        # non-monotonic counter (e.g. ...30, 0, 1...) starts a new trial instead
+        # of merging into an earlier same-numbered trial; the session test also
+        # splits trials that share a number across two sessions.
+        if not trials or trial_num != prev_trial_num or session_index != prev_session:
             t = _make_empty_trial()
             t["Trial_number"] = trial_num
+            t["Session"] = session_index
             trials.append(t)
         prev_trial_num = trial_num
+        prev_session = session_index
 
         trial = trials[-1]
 
@@ -358,4 +443,4 @@ def parse_comments(
         if not _is_nan(trial["Start"]) and trial["Start"] > 0:
             trial["Save_complete"] = 1
 
-    return experiment, trials
+    return experiments, trials

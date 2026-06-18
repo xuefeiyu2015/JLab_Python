@@ -17,62 +17,165 @@ from ._parser import parse_comments
 
 class BlackRockLoader:
     """
-    Load a Blackrock NEV file and export experiment metadata + trial data.
+    Load a Blackrock session and export experiment metadata + trial data.
     Optionally loads and exports an NSx analog file (e.g. .ns2 for eye tracking).
+
+    Construction is folder-based, mirroring BackRockFileLoader.m: no filenames
+    needed. `session_path` is the directory that holds the `raw_data` and
+    `export_data` sub-folders (assemble it in the notebook, e.g.
+    ``Path(Basic_Path) / Monkey / Location``). The .nev (and optional .ns2) are
+    auto-detected from ``session_path / data_type / date`` — the largest file
+    wins when several exist — and output goes to
+    ``session_path / output_folder / date``.
 
     Parameters
     ----------
-    nev_path : str or Path
-        Path to the .nev file.
-    output_dir : str or Path, optional
-        Directory for output files. Defaults to the same directory as nev_path.
-    date_str : str, optional
-        Date string used in output filenames (YYYY-MM-DD).
-        Auto-detected from the NEV header TimeOrigin if not provided.
-    ns_path : str or Path, optional
-        Path to the analog NSx file (.ns2, .ns4, .ns6).
-        If provided, run() will also load and export analog data to
-        Blackrock_YYYY-MM-DD_analog.csv.
+    session_path : str or Path
+        Directory containing the `data_type` and `output_folder` sub-folders
+        (i.e. ``Basic_Path / "Monkey <name>" / Location``).
+    date : str
+        Year-month-date folder, e.g. "2026-06-17". Also used as the date string
+        in output filenames.
+    data_type : str
+        Raw-data sub-folder name. Default "raw_data".
+    nev_filename : str, optional
+        Explicit .nev filename to load instead of auto-picking the largest.
+        Use list_nev_files() to see what is available.
+    load_analog : bool
+        If True, auto-detect an NSx file (the largest one, or `ns_filename` if
+        given). Skipped with a message if none found.
+    ns_marker : str
+        NSx file extension to look for, without the dot. Default "ns2" (eye
+        tracking); use "ns6" or others for different sampling rates.
+    ns_filename : str, optional
+        Explicit NSx filename to load instead of auto-picking the largest.
+    output_folder : str
+        Export sub-folder name. Default "export_data".
     verbose : bool
         Print progress messages. Default True.
 
     Examples
     --------
     >>> from jlab import BlackRockLoader
+    >>> from pathlib import Path
+    >>> session = Path(Basic_Path) / "Monkey Porthos" / "in_lab"
 
-    >>> # NEV only
-    >>> loader = BlackRockLoader("file.nev", output_dir="output/")
+    >>> # See which .nev files are in the folder, then load one
+    >>> BlackRockLoader.list_nev_files(session, "2026-06-17")
+
+    >>> # NEV only (largest auto-detected)
+    >>> loader = BlackRockLoader(session, "2026-06-17")
     >>> output_dir, files = loader.run()
 
-    >>> # NEV + analog
-    >>> loader = BlackRockLoader("file.nev", output_dir="output/", ns_path="file.ns2")
+    >>> # NEV + analog, picking a specific .nev
+    >>> loader = BlackRockLoader(session, "2026-06-17",
+    ...                          nev_filename="Hub1-Porthos_....nev", load_analog=True)
     >>> output_dir, files = loader.run()  # files includes analog csv name
     """
 
     def __init__(
         self,
-        nev_path: str | Path,
-        output_dir: str | Path | None = None,
-        date_str: str | None = None,
-        ns_path: str | Path | None = None,
+        session_path: str | Path,
+        date: str,
+        *,
+        data_type: str = "raw_data",
+        nev_filename: str | None = None,
+        load_analog: bool = False,
+        ns_marker: str = "ns2",
+        ns_filename: str | None = None,
+        output_folder: str = "export_data",
         verbose: bool = True,
     ) -> None:
-        self.nev_path = Path(nev_path)
-        if not self.nev_path.exists():
-            raise FileNotFoundError(f"NEV file not found: {self.nev_path}")
-
-        self.output_dir = Path(output_dir) if output_dir else self.nev_path.parent
-        self.ns_path = Path(ns_path) if ns_path else None
-        if self.ns_path is not None and not self.ns_path.exists():
-            raise FileNotFoundError(f"NS file not found: {self.ns_path}")
-
+        self.session_path = Path(session_path)
+        self.date = date
+        self.date_str = date
         self.verbose = verbose
-        self.date_str = date_str
+        self.data_folder = self.session_path / data_type / date
 
-        self.experiment: dict | None = None
+        # Auto-detect the .nev (largest), or use an explicit nev_filename.
+        self.nev_path = self._resolve_file(self.data_folder, "*.nev", nev_filename, "NEV")
+
+        # Auto-detect the NSx analog file only when requested.
+        self.ns_marker = ns_marker.lstrip(".").lower()
+        self.ns_path: Path | None = None
+        if load_analog:
+            pattern = f"*.{self.ns_marker}"
+            try:
+                self.ns_path = self._resolve_file(
+                    self.data_folder, pattern, ns_filename, self.ns_marker.upper()
+                )
+            except FileNotFoundError:
+                if verbose:
+                    print(f"No .{self.ns_marker} analog file found; skipping analog load.")
+
+        self.output_dir = self.session_path / output_folder / date
+
+        if verbose:
+            print(f"NEV file      : {self.nev_path.name}")
+            if self.ns_path is not None:
+                print(f"Analog file   : {self.ns_path.name}")
+            print(f"Output dir    : {self.output_dir}")
+
+        self.experiments: list[dict] | None = None
         self.trials: list[dict] | None = None
         self.analog: dict | None = None
         self._tick_rate: int | None = None
+
+    # ── File detection helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_file(
+        folder: Path, pattern: str, filename: str | None, label: str
+    ) -> Path:
+        """Return an explicit `filename` in `folder`, else the largest match of
+        `pattern`. Raises FileNotFoundError if nothing matches."""
+        if filename is not None:
+            path = folder / filename
+            if not path.exists():
+                raise FileNotFoundError(f"{label} file not found: {path}")
+            return path
+        matches = sorted(folder.glob(pattern))
+        if not matches:
+            raise FileNotFoundError(f"No {pattern} file found in: {folder}")
+        return max(matches, key=lambda p: p.stat().st_size)  # largest wins
+
+    @classmethod
+    def list_nev_files(
+        cls, session_path: str | Path, date: str, *, data_type: str = "raw_data"
+    ) -> list[Path]:
+        """
+        List the .nev files in a session's raw-data folder (largest first), with
+        sizes. Use this to choose a `nev_filename` when several recordings exist.
+
+        Returns the list of paths; also prints them when called interactively.
+        """
+        return cls._list_files(session_path, date, "*.nev", data_type)
+
+    @classmethod
+    def list_ns_files(
+        cls,
+        session_path: str | Path,
+        date: str,
+        *,
+        ns_marker: str = "ns2",
+        data_type: str = "raw_data",
+    ) -> list[Path]:
+        """List the NSx analog files (default .ns2) in a session's raw-data
+        folder (see list_nev_files). Pass ns_marker="ns6" etc. for others."""
+        marker = ns_marker.lstrip(".").lower()
+        return cls._list_files(session_path, date, f"*.{marker}", data_type)
+
+    @staticmethod
+    def _list_files(
+        session_path: str | Path, date: str, pattern: str, data_type: str
+    ) -> list[Path]:
+        folder = Path(session_path) / data_type / date
+        files = sorted(folder.glob(pattern), key=lambda p: p.stat().st_size, reverse=True)
+        if not files:
+            print(f"No {pattern} file found in: {folder}")
+        for p in files:
+            print(f"{p.stat().st_size / 1e6:8.1f} MB  {p.name}")
+        return files
 
     # ── Properties ────────────────────────────────────────────────────────
 
@@ -92,7 +195,7 @@ class BlackRockLoader:
 
     def load_nev(self) -> "BlackRockLoader":
         """
-        Read and parse the NEV file. Populates self.experiment and self.trials.
+        Read and parse the NEV file. Populates self.experiments and self.trials.
         Returns self for method chaining.
         """
         if self.verbose:
@@ -103,7 +206,7 @@ class BlackRockLoader:
         if self.verbose:
             print(f"  {len(comments)} events found")
 
-        self.experiment, self.trials = parse_comments(comments, times_s)
+        self.experiments, self.trials = parse_comments(comments, times_s)
         compute_derived_features(self.trials)
 
         if self.verbose:
@@ -129,15 +232,19 @@ class BlackRockLoader:
                 return False
 
         # ── Session length ─────────────────────────────────────────────────
-        exp = self.experiment or {}
-        start, end = exp.get("start", float("nan")), exp.get("end", float("nan"))
+        # A recording can hold several sessions; report the count and the overall
+        # span (earliest start → latest end across all sessions).
+        sessions = self.experiments or []
+        starts = [e.get("start") for e in sessions if not _isnan(e.get("start"))]
+        ends = [e.get("end") for e in sessions if not _isnan(e.get("end"))]
 
         print("Session Summary")
         print("─" * 50)
-        if not _isnan(start) and not _isnan(end):
-            duration = end - start
+        print(f"Sessions       : {len(sessions)}")
+        if starts and ends:
+            duration = max(ends) - min(starts)
             mins, secs = int(duration // 60), duration % 60
-            print(f"Session length : {mins} min {secs:.1f} sec")
+            print(f"Total length   : {mins} min {secs:.1f} sec")
         print(f"Total trials   : {len(self.trials)}"
               f"  ({sum(t['Save_complete'] == 1 for t in self.trials)} complete)")
 
@@ -192,12 +299,12 @@ class BlackRockLoader:
         -------
         (txt_path, csv_path)
         """
-        if self.experiment is None or self.trials is None:
+        if self.experiments is None or self.trials is None:
             raise RuntimeError("Call load_nev() before export().")
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        write_expmeta(self.experiment, self.txt_path)
+        write_expmeta(self.experiments, self.txt_path)
         write_trials_csv(self.trials, self.csv_path)
 
         return self.txt_path, self.csv_path
