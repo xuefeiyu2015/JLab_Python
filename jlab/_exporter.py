@@ -78,15 +78,22 @@ def _csv_value(val) -> str:
 
 # ── Public writers ─────────────────────────────────────────────────────────
 
-def write_expmeta(experiment: dict, path: Path) -> None:
+def write_expmeta(experiments: list[dict], path: Path) -> None:
     """
-    Write experiment metadata to a .txt file.
-    Format mirrors MATLAB:  fprintf(fid, '%s: %s\\n', field, mat2str(val))
+    Write per-session experiment metadata to a .txt file.
+
+    One section per session, separated by a "Session N:" header and a blank line.
+    Format mirrors MATLAB (BackRockFileLoader.m 687-701):
+        fprintf(fid, 'Session %d:\\n', s)
+        fprintf(fid, '%s: %s\\n', field, mat2str(val))
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fid:
-        for field, val in experiment.items():
-            fid.write(f"{field}: {_mat2str(val)}\n")
+        for s, experiment in enumerate(experiments, start=1):
+            fid.write(f"Session {s}:\n")
+            for field, val in experiment.items():
+                fid.write(f"{field}: {_mat2str(val)}\n")
+            fid.write("\n")
 
 
 def write_trials_csv(trials: list[dict], path: Path) -> None:
