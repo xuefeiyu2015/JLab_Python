@@ -163,7 +163,8 @@ Output folder: /path/to/your/Data/Monkey Porthos/in_lab/export_data/2026-06-17
 
 To process more than one session at once, use the `run_batch` **classmethod**. Pass
 a **list of dates**, or omit `dates` to auto-discover every `YYYY-MM-DD` folder under
-`raw_data/`. It runs each date through the same pipeline and returns a summary list.
+`raw_data/`. It builds one single-date `BlackRockLoader` per date, runs it through the
+same load + export pipeline, and returns a summary list.
 
 ```python
 from pathlib import Path
@@ -174,17 +175,23 @@ Session_Path = Path("/path/to/your/Data") / "Monkey Porthos" / "in_lab"
 # Specific dates
 report = BlackRockLoader.run_batch(Session_Path, dates=["2026-06-17", "2026-06-18"])
 
-# Every date folder under raw_data/ (skip ones already exported)
-report = BlackRockLoader.run_batch(Session_Path, skip_existing=True)
+# Every date folder under raw_data/, also exporting analog, skipping already-done dates
+report = BlackRockLoader.run_batch(Session_Path, load_analog=True, skip_existing=True)
 
 for r in report:
-    print(r["date"], r["status"])   # status: "ok" | "skipped" | "failed"
+    print(r["date"], r["status"])           # "ok" | "skipped" | "failed"
+    if r["status"] == "ok":
+        print(" ", r["output_dir"], r["files"])
+    elif r["status"] == "failed":
+        print(" ", r["error"])
 ```
 
-A date that fails (e.g. missing `.nev`) is recorded and skipped so the batch
-always finishes; the failure shows up in the report with an `"error"` message.
+**Continue-on-error:** a date that fails (e.g. missing `.nev`, parse error) is
+recorded and skipped so the batch always finishes — the failure shows up in the
+report with an `"error"` message instead of raising.
 
 ```
+Batch: 3 date folder(s)
 [1/3] 2026-06-17  ... OK
 [2/3] 2026-06-18  ... FAILED (No *.nev file found in: .../raw_data/2026-06-18)
 [3/3] 2026-06-19  ... OK
@@ -192,10 +199,33 @@ always finishes; the failure shows up in the report with an `"error"` message.
 Done: 2 ok, 0 skipped, 1 failed
 ```
 
-`run_batch` options: `skip_existing` (skip already-exported dates), plus the usual
-`data_type`, `output_folder`, `load_analog`, and `ns_marker`. For per-session
-inspection like `print_summary()`, construct a single-date `BlackRockLoader` for that
-date.
+**Report structure** — one dict per date:
+
+| Key | Always present | Description |
+|---|---|---|
+| `date` | yes | The `YYYY-MM-DD` string |
+| `status` | yes | `"ok"`, `"skipped"`, or `"failed"` |
+| `output_dir` | on `"ok"` | `Path` to the export folder |
+| `files` | on `"ok"` | List of exported filenames |
+| `error` | on `"failed"` | Error message string |
+
+**`run_batch` options:**
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `dates` | `None` | List of dates, or `None`/empty to auto-discover every `YYYY-MM-DD` folder |
+| `skip_existing` | `False` | Skip dates whose `_expmeta.txt` **and** `_trials.csv` already exist |
+| `load_analog` | `False` | Also load + export the NSx analog file for each date |
+| `ns_marker` | `"ns2"` | NSx extension to load when `load_analog=True` |
+| `data_type` | `"raw_data"` | Raw-data sub-folder name |
+| `output_folder` | `"export_data"` | Export sub-folder name |
+| `verbose` | `True` | Print per-date progress |
+
+> **Note:** batch mode always auto-detects the **largest** `.nev` (and NSx) file in
+> each date folder — there's no per-date `nev_filename`/`ns_filename`. If a folder has
+> several recordings and you need a specific one, load that date with a single
+> `BlackRockLoader` instead. The same applies to per-session inspection like
+> `print_summary()`.
 
 ## Notebooks
 
