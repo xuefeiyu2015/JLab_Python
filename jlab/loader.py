@@ -35,7 +35,8 @@ class BlackRockLoader:
         (i.e. ``Basic_Path / "Monkey <name>" / Location``).
     date : str
         Year-month-date folder, e.g. "2026-06-17". Also used as the date string
-        in output filenames.
+        in output filenames. To process several dates at once, use the
+        ``run_batch`` classmethod instead.
     data_type : str
         Raw-data sub-folder name. Default "raw_data".
     nev_filename : str, optional
@@ -71,6 +72,9 @@ class BlackRockLoader:
     >>> loader = BlackRockLoader(session, "2026-06-17",
     ...                          nev_filename="Hub1-Porthos_....nev", load_analog=True)
     >>> output_dir, files = loader.run()  # files includes analog csv name
+
+    >>> # Several dates at once (or run_batch(session) to do every date folder)
+    >>> report = BlackRockLoader.run_batch(session, dates=["2026-06-17", "2026-06-18"])
     """
 
     def __init__(
@@ -176,6 +180,49 @@ class BlackRockLoader:
         for p in files:
             print(f"{p.stat().st_size / 1e6:8.1f} MB  {p.name}")
         return files
+
+    # ── Batch helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_dates(
+        session_path: str | Path, dates: str | list | tuple | None, data_type: str
+    ) -> list[str]:
+        """Normalise a `dates` argument into a list of date strings.
+
+        A non-empty string becomes a single-element list; a non-empty list/tuple
+        is used as-is (order preserved). An empty value or None triggers
+        discovery: every ``YYYY-MM-DD`` folder under
+        ``session_path / data_type`` (sorted).
+        """
+        if isinstance(dates, str):
+            if dates:
+                return [dates]
+        elif dates:  # non-empty list/tuple
+            return [str(d) for d in dates]
+
+        # Discover date-named folders in the raw-data root.
+        root = Path(session_path) / data_type
+        if not root.is_dir():
+            raise FileNotFoundError(f"Raw-data folder not found: {root}")
+        found = sorted(
+            p.name
+            for p in root.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]")
+            if p.is_dir()
+        )
+        if not found:
+            raise FileNotFoundError(f"No YYYY-MM-DD date folders found in: {root}")
+        return found
+
+    @staticmethod
+    def _exports_exist(
+        session_path: str | Path, date: str, output_folder: str
+    ) -> bool:
+        """True if both the expmeta .txt and trials .csv already exist for `date`."""
+        out = Path(session_path) / output_folder / date
+        return (
+            (out / f"Blackrock_{date}_expmeta.txt").exists()
+            and (out / f"Blackrock_{date}_trials.csv").exists()
+        )
 
     # ── Properties ────────────────────────────────────────────────────────
 
@@ -344,6 +391,88 @@ class BlackRockLoader:
             self.export_analog()
             filenames.append(self.analog_csv_path.name)
         return self.output_dir, filenames
+
+    @classmethod
+    def run_batch(
+        cls,
+        session_path: str | Path,
+        dates: str | list[str] | None = None,
+        *,
+        data_type: str = "raw_data",
+        load_analog: bool = False,
+        ns_marker: str = "ns2",
+        output_folder: str = "export_data",
+        skip_existing: bool = False,
+        verbose: bool = True,
+    ) -> list[dict]:
+        """
+        Load and export several date folders in one call.
+
+        Builds one single-date BlackRockLoader per date and runs it, reusing the
+        same parse/export pipeline. A date that fails (e.g. missing .nev, parse
+        error) is recorded and skipped so the batch always finishes.
+
+        Parameters
+        ----------
+        session_path : str or Path
+            Directory containing the `data_type` and `output_folder` sub-folders
+            (i.e. ``Basic_Path / "Monkey <name>" / Location``).
+        dates : str or list[str] or None
+            A year-month-date string, a list of them, or None/empty to discover
+            and process every ``YYYY-MM-DD`` folder under
+            ``session_path / data_type`` (sorted).
+        data_type, load_analog, ns_marker, output_folder, verbose
+            Forwarded to each per-date loader (see BlackRockLoader).
+        skip_existing : bool
+            Skip dates whose expmeta .txt and trials .csv already exist, so a
+            re-run only processes new folders. Default False.
+
+        Returns
+        -------
+        list[dict] — one per date, each with keys:
+            "date", "status" ("ok" | "skipped" | "failed"),
+            and ("output_dir", "files") on success or "error" on failure.
+        """
+        session_path = Path(session_path)
+        date_list = cls._resolve_dates(session_path, dates, data_type)
+
+        results: list[dict] = []
+        n = len(date_list)
+        if verbose:
+            print(f"Batch: {n} date folder(s)")
+
+        for i, d in enumerate(date_list, 1):
+            prefix = f"[{i}/{n}] {d}"
+
+            if skip_existing and cls._exports_exist(session_path, d, output_folder):
+                print(f"{prefix}  ... SKIPPED (already exported)")
+                results.append({"date": d, "status": "skipped"})
+                continue
+
+            try:
+                loader = cls(
+                    session_path,
+                    d,
+                    data_type=data_type,
+                    load_analog=load_analog,
+                    ns_marker=ns_marker,
+                    output_folder=output_folder,
+                    verbose=verbose,
+                )
+                output_dir, files = loader.run()
+                print(f"{prefix}  ... OK")
+                results.append(
+                    {"date": d, "status": "ok", "output_dir": output_dir, "files": files}
+                )
+            except Exception as e:  # continue-on-error
+                print(f"{prefix}  ... FAILED ({e})")
+                results.append({"date": d, "status": "failed", "error": str(e)})
+
+        n_ok = sum(r["status"] == "ok" for r in results)
+        n_skip = sum(r["status"] == "skipped" for r in results)
+        n_fail = sum(r["status"] == "failed" for r in results)
+        print(f"\nDone: {n_ok} ok, {n_skip} skipped, {n_fail} failed")
+        return results
 
     def load_analog(
         self,

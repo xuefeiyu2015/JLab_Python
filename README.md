@@ -3,7 +3,7 @@
 Python package for loading and exporting Blackrock NEV/NSx data from JLab experiments.
 Replicates the output of `BackRockFileLoader.m`[Matlab Version](https://github.com/xuefeiyu2015/JLab) — produces identical `.txt` and `.csv` files.
 
-Last update: Xuefei Yu, 06-18-2026
+Last update: Xuefei Yu, 06-19-2026
 
 
 ## What it does
@@ -158,6 +158,44 @@ Output folder: /path/to/your/Data/Monkey Porthos/in_lab/export_data/2026-06-17
   Blackrock_2026-06-17_trials.csv
   Blackrock_2026-06-17_analog.csv
 ```
+
+## Batch loading (multiple dates)
+
+To process more than one session at once, use the `run_batch` **classmethod**. Pass
+a **list of dates**, or omit `dates` to auto-discover every `YYYY-MM-DD` folder under
+`raw_data/`. It runs each date through the same pipeline and returns a summary list.
+
+```python
+from pathlib import Path
+from jlab import BlackRockLoader
+
+Session_Path = Path("/path/to/your/Data") / "Monkey Porthos" / "in_lab"
+
+# Specific dates
+report = BlackRockLoader.run_batch(Session_Path, dates=["2026-06-17", "2026-06-18"])
+
+# Every date folder under raw_data/ (skip ones already exported)
+report = BlackRockLoader.run_batch(Session_Path, skip_existing=True)
+
+for r in report:
+    print(r["date"], r["status"])   # status: "ok" | "skipped" | "failed"
+```
+
+A date that fails (e.g. missing `.nev`) is recorded and skipped so the batch
+always finishes; the failure shows up in the report with an `"error"` message.
+
+```
+[1/3] 2026-06-17  ... OK
+[2/3] 2026-06-18  ... FAILED (No *.nev file found in: .../raw_data/2026-06-18)
+[3/3] 2026-06-19  ... OK
+
+Done: 2 ok, 0 skipped, 1 failed
+```
+
+`run_batch` options: `skip_existing` (skip already-exported dates), plus the usual
+`data_type`, `output_folder`, `load_analog`, and `ns_marker`. For per-session
+inspection like `print_summary()`, construct a single-date `BlackRockLoader` for that
+date.
 
 ## Notebooks
 
