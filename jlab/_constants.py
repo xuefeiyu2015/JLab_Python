@@ -2,6 +2,20 @@
 # last updates: 06-18-2026 by Xuefei Yu
 import re
 
+# ── File role schema (mirrors BlackrockLoader.m properties) ────────────────
+# One session is split across files by filename prefix; the loader picks each
+# file by its prefix and verifies the expected data is present before using it.
+COMMENT_PREFIX_PRIMARY = "NSP"   # NSP-*.nev: comments + comment timing
+COMMENT_PREFIX_LEGACY = "HUB"    # HUB-*.nev: legacy fallback for comments
+SPIKE_PREFIX = "HUB"             # HUB-*.nev: online spike timing
+ANALOG_PREFIX = "NSP"            # NSP-*.ns2: analog/eye data
+
+# ── Trial-segmentation defaults (ms) ───────────────────────────────────────
+# Window per trial = [Start - pre, End + post]; spikes binned at bin width.
+SEGMENT_PRE_MS = 500
+SEGMENT_POST_MS = 500
+SEGMENT_BIN_MS = 1
+
 # ── Experiment-level event map ─────────────────────────────────────────────
 # Maps text tokens in "Experiment start/end:" lines → experiment struct fields
 EXP_EVENTS: dict[str, str] = {
