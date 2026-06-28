@@ -1,18 +1,31 @@
 # Python Package:  jlab
 
 Python package for loading and exporting Blackrock NEV/NSx data from JLab experiments.
-Replicates the output of `BackRockFileLoader.m`[Matlab Version](https://github.com/xuefeiyu2015/JLab) — produces identical `.txt` and `.csv` files.
+Replicates the output of `BackRockFileLoader.m` / `BlackrockLoader.m` [Matlab Version](https://github.com/xuefeiyu2015/JLab) — same parsing schema, segmentation, and output products.
 
-Last update: Xuefei Yu, 06-19-2026
+Last update: Xuefei Yu, 06-28-2026
 
 
 ## What it does
 
-- Reads a Blackrock `.nev` file file and parses behavioral trial event comments into trial based structure
-- Reads a Blackrock `.ns2` file file and parses eye data into trial based structure (under construction)
-- Exports `Blackrock_YYYY-MM-DD_expmeta.txt` — experiment metadata (one key: value per line)
-- Exports `Blackrock_YYYY-MM-DD_trials.csv` — per-trial behavioral data with derived features
-- Optionally loads a `.ns2` analog file (eye tracking) and exports it to `Blackrock_YYYY-MM-DD_analog.csv`(under construction)
+A session is split across files by **filename prefix**, and the loader picks each
+file by its role (mirroring the MATLAB `BlackrockLoader`):
+
+- `NSP-*.nev` → behavioral trial event comments, parsed into a trial-based structure
+- `NSP-*.ns2` → analog (eye) data, segmented per trial
+- `HUB-*.nev` → online spike timing, rasterized per trial (also the **legacy fallback** for comments)
+
+Outputs (written to `export_data/<Date>/`):
+
+- `Blackrock_YYYY-MM-DD_expmeta.txt` — experiment metadata (one key: value per line)
+- `Blackrock_YYYY-MM-DD_trials.csv` — per-trial behavioral data with derived features
+- `Blackrock_YYYY-MM-DD_analog.mat` — analog segmented into trials (`load_analog=True`)
+- `Blackrock_YYYY-MM-DD_spikes.mat` — online spikes rasterized into trials (`load_spikes=True`)
+
+The two segmented `.mat` files hold a struct with `data` (channels/units × trials ×
+samples/bins, NaN-padded), `timeseq` (`alignedrawtime`, `aligned_marker`,
+`relative_time`), and `info` (`samplingrate`, `Session`, `Trial_number`, plus
+`Channel_Number`/`Unit_No` for spikes) — byte-for-byte aligned with the MATLAB output.
 
 ## Requirements
 
@@ -76,13 +89,15 @@ Your data must be laid out like this:
     └── <Location>/                 ← this is the "session path"
         ├── raw_data/
         │   └── <Date>/             ← e.g. 2026-06-17
-        │       ├── *.nev           ← behavioral events (largest is auto-picked)
-        │       └── *.ns2           ← optional analog / eye tracking
+        │       ├── NSP-*.nev       ← behavioral events (largest NSP-* is auto-picked)
+        │       ├── NSP-*.ns2       ← optional analog / eye tracking
+        │       └── HUB-*.nev       ← optional online spikes (legacy comment fallback)
         └── export_data/            ← created automatically
             └── <Date>/
                 ├── Blackrock_<Date>_expmeta.txt
                 ├── Blackrock_<Date>_trials.csv
-                └── Blackrock_<Date>_analog.csv
+                ├── Blackrock_<Date>_analog.mat   ← if load_analog=True
+                └── Blackrock_<Date>_spikes.mat   ← if load_spikes=True
 ```
 
 Build the **session path** from your own folder structure, then pass it with the
@@ -111,9 +126,14 @@ Defaults you can override in the constructor:
 |---|---|---|
 | `data_type` | `"raw_data"` | name of the raw-data sub-folder |
 | `output_folder` | `"export_data"` | name of the export sub-folder |
+| `load_analog` | `False` | load + segment the `NSP-*.ns2` analog file |
+| `load_spikes` | `False` | load + rasterize online spikes from the `HUB-*.nev` file |
 | `ns_marker` | `"ns2"` | NSx analog extension (use `"ns6"` etc. for other rates) |
-| `nev_filename` | auto | pick a specific `.nev` instead of the largest |
-| `ns_filename` | auto | pick a specific NSx file instead of the largest |
+| `nev_filename` | auto | pick a specific comment `.nev` instead of the `NSP-*` auto-pick |
+| `ns_filename` | auto | pick a specific NSx file instead of the `NSP-*` auto-pick |
+| `spike_nev_filename` | auto | pick a specific spike `.nev` instead of the `HUB-*` auto-pick |
+| `pre_ms`, `post_ms` | `500` | trial-segmentation buffers (ms): window = `[Start - pre, End + post]` |
+| `bin_ms` | `1` | spike-raster bin width (ms) |
 
 ## Quick start
 
@@ -129,10 +149,12 @@ BlackRockLoader.list_nev_files(Session_Path, Date)
 
 loader = BlackRockLoader(
     Session_Path, Date,
-    load_analog=True,        # also auto-detect the NSx analog (eye-tracking) file
-    # nev_filename="...",    # optional: pick a specific .nev (else the largest)
+    load_analog=True,        # segment the NSP-*.ns2 analog (eye-tracking) file
+    load_spikes=True,        # rasterize online spikes from the HUB-*.nev file
+    # nev_filename="...",    # optional: pick a specific comment .nev (else largest NSP-*)
     # ns_marker="ns2",       # NSx extension to load; default "ns2", e.g. "ns6"
     # ns_filename="...",     # optional: pick a specific NSx file
+    # pre_ms=500, post_ms=500, bin_ms=1,   # segmentation buffers / raster bin width
 )
 
 output_dir, files = loader.run()
@@ -144,19 +166,24 @@ for f in files:
 
 Output:
 ```
-NEV file      : Hub1-Porthos_20260617.nev
-Analog file   : Hub1-Porthos_20260617.ns2
+Comment NEV   : NSP-Porthos_20260617.nev
+Analog file   : NSP-Porthos_20260617.ns2
+Spike NEV     : HUB-Porthos_20260617.nev
 Output dir    : /path/to/your/Data/Monkey Porthos/in_lab/export_data/2026-06-17
-Loading NEV: Hub1-Porthos_20260617.nev
-  210 events found
+Loading NEV: NSP-Porthos_20260617.nev  (210 events)
   68 trials parsed (68 complete)
-Loading analog: Hub1-Porthos_20260617.ns2
-  3 channels, 1 segment(s), 279280 samples, 1000.0 Hz
+Loading analog: NSP-Porthos_20260617.ns2
+  3 channels, 279280 samples, 1000.0 Hz
+  Analog segmented (68 trials) -> Blackrock_2026-06-17_analog.mat
+Loading spikes: HUB-Porthos_20260617.nev
+  15234 spikes loaded
+  Spikes rasterized (24 units x 68 trials) -> Blackrock_2026-06-17_spikes.mat
 
 Output folder: /path/to/your/Data/Monkey Porthos/in_lab/export_data/2026-06-17
   Blackrock_2026-06-17_expmeta.txt
   Blackrock_2026-06-17_trials.csv
-  Blackrock_2026-06-17_analog.csv
+  Blackrock_2026-06-17_analog.mat
+  Blackrock_2026-06-17_spikes.mat
 ```
 
 ## Batch loading (multiple dates)
@@ -175,8 +202,10 @@ Session_Path = Path("/path/to/your/Data") / "Monkey Porthos" / "in_lab"
 # Specific dates
 report = BlackRockLoader.run_batch(Session_Path, dates=["2026-06-17", "2026-06-18"])
 
-# Every date folder under raw_data/, also exporting analog, skipping already-done dates
-report = BlackRockLoader.run_batch(Session_Path, load_analog=True, skip_existing=True)
+# Every date folder under raw_data/, also exporting analog + spikes, skipping already-done dates
+report = BlackRockLoader.run_batch(
+    Session_Path, load_analog=True, load_spikes=True, skip_existing=True
+)
 
 for r in report:
     print(r["date"], r["status"])           # "ok" | "skipped" | "failed"
@@ -215,17 +244,20 @@ Done: 2 ok, 0 skipped, 1 failed
 |---|---|---|
 | `dates` | `None` | List of dates, or `None`/empty to auto-discover every `YYYY-MM-DD` folder |
 | `skip_existing` | `False` | Skip dates whose `_expmeta.txt` **and** `_trials.csv` already exist |
-| `load_analog` | `False` | Also load + export the NSx analog file for each date |
+| `load_analog` | `False` | Also segment + export the `NSP-*.ns2` analog file for each date |
+| `load_spikes` | `False` | Also rasterize + export online spikes from the `HUB-*.nev` file |
 | `ns_marker` | `"ns2"` | NSx extension to load when `load_analog=True` |
+| `pre_ms`, `post_ms` | `500` | Trial-segmentation buffers (ms) |
+| `bin_ms` | `1` | Spike-raster bin width (ms) |
 | `data_type` | `"raw_data"` | Raw-data sub-folder name |
 | `output_folder` | `"export_data"` | Export sub-folder name |
 | `verbose` | `True` | Print per-date progress |
 
-> **Note:** batch mode always auto-detects the **largest** `.nev` (and NSx) file in
-> each date folder — there's no per-date `nev_filename`/`ns_filename`. If a folder has
-> several recordings and you need a specific one, load that date with a single
-> `BlackRockLoader` instead. The same applies to per-session inspection like
-> `print_summary()`.
+> **Note:** batch mode auto-detects the **largest** matching file per role prefix in
+> each date folder (`NSP-*` for comments/analog, `HUB-*` for spikes) — there's no
+> per-date `nev_filename`/`ns_filename`. If a folder has several recordings and you need
+> a specific one, load that date with a single `BlackRockLoader` instead. The same
+> applies to per-session inspection like `print_summary()`.
 
 ## Notebooks
 
@@ -237,7 +269,7 @@ jupyter lab
 
 | Notebook | Description |
 |---|---|
-| `01_load_and_export.ipynb` | Load a `.nev` file and export `.txt` / `.csv` / analog |
+| `01_load_and_export.ipynb` | Load NSP/HUB files and export `.txt` / `.csv` / segmented analog + spike `.mat` |
 | `02_psychometric_analysis.ipynb` | Load exported CSV, fit logistic function, plot psychometric curve |
 
 Edit the path variables at the top of each notebook (marked with `# ── Edit these variables`).
@@ -273,8 +305,29 @@ One row per trial. Key columns:
 | `Choose_target` | Which target was chosen (1 or 2) |
 | `Choose_leftright` | 1 = rightward, −1 = leftward |
 
-### `_analog.csv` (under construction)
-One row per sample, columns named `channel_1`, `channel_2`, etc. (electrode IDs from the NSx file).
+### `_analog.mat`
+Analog stream segmented into trials. A MATLAB struct `analog` with:
+
+| Field | Shape | Description |
+|---|---|---|
+| `data` | channels × trials × samples | continuous analog (µV), NaN-padded to the longest trial |
+| `timeseq.alignedrawtime` | trials | absolute time (s) of each trial's `Start` marker |
+| `timeseq.aligned_marker` | — | `"Start"` (event that `relative_time` = 0 aligns to) |
+| `timeseq.relative_time` | samples | seconds from the `Start` marker (negative through the pre-buffer) |
+| `info.samplingrate` | — | analog sampling rate (Hz) |
+| `info.Session`, `info.Trial_number` | trials | per-trial session index / trial number |
+
+Load it in Python with `scipy.io.loadmat(path, squeeze_me=True, struct_as_record=False)`.
+
+### `_spikes.mat`
+Online spikes rasterized into per-trial bins. A MATLAB struct `online_spike` with the
+same `timeseq` layout as above, plus:
+
+| Field | Shape | Description |
+|---|---|---|
+| `data` | units × trials × bins | binary raster (0/1), NaN-padded; one row per `(channel, unit)` pair |
+| `info.samplingrate` | — | bin rate (Hz), 1000 for 1 ms bins |
+| `info.Channel_Number`, `info.Unit_No` | units | electrode / unit id per raster row |
 
 ## Step-by-step API (if you want to do some basic analysis directly after exporting)
 
@@ -283,23 +336,27 @@ from pathlib import Path
 from jlab import BlackRockLoader
 
 Session_Path = Path("/path/to/your/Data") / "Monkey Porthos" / "in_lab"
-loader = BlackRockLoader(Session_Path, "2026-06-17", load_analog=True)
+loader = BlackRockLoader(Session_Path, "2026-06-17", load_analog=True, load_spikes=True)
 
-# Step 1 — load and parse the NEV file
+# Step 1 — load and parse the comment NEV file
 loader.load_nev()
 
 # Step 2 — export .txt and .csv
 loader.export()
 
-# Step 3 — load and export analog (optional)
-# self.ns_path was auto-detected because load_analog=True was passed
-loader.load_analog(loader.ns_path)
+# Step 3 — segment + export analog (optional; needs load_analog=True)
+loader.load_analog()
 loader.export_analog()
 
+# Step 4 — rasterize + export online spikes (optional; needs load_spikes=True)
+loader.load_spikes()
+loader.export_spikes()
+
 # Access parsed data directly
-loader.experiments  # list of experiment-metadata dicts (one per session)
-loader.trials       # list of per-trial dicts
-loader.analog       # dict with 'data', 'elec_ids', 'samp_per_s'
+loader.experiments   # list of experiment-metadata dicts (one per session)
+loader.trials        # list of per-trial dicts
+loader.analog        # raw brpylib dict ('data', 'elec_ids', 'samp_per_s', ...)
+loader.spike_times   # spike timestamps (s); also spike_channel / spike_unit
 ```
 
 ## Project structure
@@ -311,7 +368,9 @@ JLab_Python/
 │   ├── _parser.py       # event comment parsing
 │   ├── _features.py     # derived feature computation (angles, eccentricity)
 │   ├── _exporter.py     # writes .txt and .csv files
-│   └── _constants.py    # event maps and regex patterns
+│   ├── _analog.py       # segment_analog — analog stream → per-trial 3D array
+│   ├── _spikes.py       # segment_spikes — online spikes → per-trial raster
+│   └── _constants.py    # file schema, event maps, regex patterns
 ├── brpylib/             # bundled Blackrock file reader
 ├── notebooks/
 │   ├── 01_load_and_export.ipynb
