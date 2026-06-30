@@ -7,8 +7,19 @@ products as the MATLAB BlackrockLoader / BackRockFileLoader.m:
   NSP-*.nev  -> experiment comments + comment timing  (-> expmeta .txt, trials .csv)
   NSP-*.ns2  -> analog/eye data                        (-> segmented analog .mat)
   HUB-*.nev  -> online spike timing                    (-> rasterized spikes .mat)
+  HUB-*.nev  -> online spike waveforms (opt-in)        (-> segmented waveforms .mat)
 HUB-*.nev is also the legacy fallback for comments (early sessions wrote comments
 and spikes both to the HUB file).
+
+Spike pipeline (source-agnostic):
+  A source-specific *reader* produces the common per-spike arrays
+  ``(times, channel, unit[, waveform])`` -> the shared, source-agnostic
+  ``segment_spikes`` / ``segment_waveforms`` align them to trials -> export.
+  Today the only reader is ``_read_online_spikes`` (online HUB NEV). Offline
+  (sorted) spikes drop in later by adding a parallel ``_read_offline_spikes`` +
+  ``load_offline_spikes`` / ``export_offline_spikes`` that reuse the SAME
+  segmenters and the shared ``drop_units`` filter, writing ``offline_spike`` /
+  ``offline_spike_waveform`` outputs. Only the information source differs.
 """
 
 from __future__ import annotations
@@ -20,7 +31,8 @@ from ._analog import segment_analog
 from ._exporter import write_expmeta, write_trials_csv
 from ._features import compute_derived_features
 from ._parser import parse_comments
-from ._spikes import segment_spikes
+from ._spikes import drop_units, segment_spikes
+from ._waveforms import segment_waveforms
 
 
 class BlackRockLoader:
@@ -37,7 +49,7 @@ class BlackRockLoader:
     ``NSP-*.ns2``, online spikes from ``HUB-*.nev``. Output goes to
     ``session_path / output_folder / date``.
 
-    Analog and spikes are gated by `load_analog` / `load_spikes`; if requested
+    Analog and spikes are gated by `load_analog` / `load_online_spikes`; if requested
     but the prefixed file is absent they are skipped with a message (soft
     failure, like the MATLAB loader). Missing comments is a hard error.
 
@@ -57,10 +69,20 @@ class BlackRockLoader:
         NSx file extension without the dot. Default "ns2".
     ns_filename : str, optional
         Explicit analog filename instead of prefix auto-pick.
-    load_spikes : bool
+    load_online_spikes : bool
         If True, load and rasterize online spikes from the HUB-*.nev file.
     spike_nev_filename : str, optional
         Explicit spike .nev filename instead of prefix auto-pick.
+    load_online_wave : bool
+        If True, also read per-spike waveforms from the HUB-*.nev file and
+        segment them into a dense per-trial array (microVolts). Off by default
+        because the dense array can be large; implies reading spikes (waveforms
+        come from the same file).
+    include_unsorted : bool
+        If True, keep every online-spike "unit", including unsorted threshold
+        crossings (unit 0) and noise (unit 255). Default False -> only sorted
+        units (1-5) are kept, which applies to BOTH the spike raster and the
+        waveform export and keeps the dense waveform array small.
     pre_ms, post_ms : float
         Trial-segmentation buffers (ms): window = [Start - pre, End + post].
         Default 500 each.
@@ -83,12 +105,12 @@ class BlackRockLoader:
 
     >>> # comments + analog + online spikes
     >>> loader = BlackRockLoader(session, "2026-06-17",
-    ...                          load_analog=True, load_spikes=True)
+    ...                          load_analog=True, load_online_spikes=True)
     >>> output_dir, files = loader.run()
 
     >>> # several dates at once (or run_batch(session) to do every date folder)
     >>> report = BlackRockLoader.run_batch(session, dates=["2026-06-17", "2026-06-18"],
-    ...                                    load_analog=True, load_spikes=True)
+    ...                                    load_analog=True, load_online_spikes=True)
     """
 
     def __init__(
@@ -101,8 +123,10 @@ class BlackRockLoader:
         load_analog: bool = False,
         ns_marker: str = "ns2",
         ns_filename: str | None = None,
-        load_spikes: bool = False,
+        load_online_spikes: bool = False,
         spike_nev_filename: str | None = None,
+        load_online_wave: bool = False,
+        include_unsorted: bool = False,
         pre_ms: float = C.SEGMENT_PRE_MS,
         post_ms: float = C.SEGMENT_POST_MS,
         bin_ms: float = C.SEGMENT_BIN_MS,
@@ -157,9 +181,15 @@ class BlackRockLoader:
                     "skipping analog load."
                 )
 
-        # ── Online spikes (HUB-*.nev), gated ─────────────────────────────────
+        # ── Online spikes / waveforms (HUB-*.nev), gated ─────────────────────
+        # Waveforms come from the same HUB-*.nev as spikes, so load_online_wave
+        # implies resolving (and reading) the spike file. The spike raster is
+        # only exported when load_online_spikes was requested in its own right.
+        self._export_online_spikes = load_online_spikes
+        self.load_online_wave = load_online_wave
+        self.include_unsorted = include_unsorted
         self.spike_nev_path: Path | None = None
-        if load_spikes:
+        if load_online_spikes or load_online_wave:
             if spike_nev_filename is not None:
                 path = self.data_folder / spike_nev_filename
                 if not path.exists():
@@ -171,7 +201,8 @@ class BlackRockLoader:
                 )
             if self.spike_nev_path is None and verbose:
                 print(
-                    f"No {C.SPIKE_PREFIX}-*.nev spike file found; skipping spike load."
+                    f"No {C.SPIKE_PREFIX}-*.nev spike file found; "
+                    "skipping spike/waveform load."
                 )
 
         self.output_dir = self.session_path / output_folder / date
@@ -182,7 +213,8 @@ class BlackRockLoader:
             if self.ns_path is not None:
                 print(f"Analog file   : {self.ns_path.name}")
             if self.spike_nev_path is not None:
-                print(f"Spike NEV     : {self.spike_nev_path.name}")
+                role = "spikes+waveforms" if self.load_online_wave else "spikes"
+                print(f"Spike NEV     : {self.spike_nev_path.name} ({role})")
             print(f"Output dir    : {self.output_dir}")
 
         self.experiments: list[dict] | None = None
@@ -194,6 +226,7 @@ class BlackRockLoader:
         self.spike_times = None
         self.spike_channel = None
         self.spike_unit = None
+        self.spike_waveform = None
         self._tick_rate: int | None = None
         self._nsx_tick_rate: int | None = None
 
@@ -308,6 +341,10 @@ class BlackRockLoader:
     def spikes_mat_path(self) -> Path:
         return self.output_dir / f"Blackrock_{self.date_str}_spikes.mat"
 
+    @property
+    def waveforms_mat_path(self) -> Path:
+        return self.output_dir / f"Blackrock_{self.date_str}_waveforms.mat"
+
     # ── Public methods ─────────────────────────────────────────────────────
 
     def load_nev(self) -> "BlackRockLoader":
@@ -388,25 +425,40 @@ class BlackRockLoader:
 
         return self
 
-    def load_spikes(self, nev_path: str | Path | None = None) -> "BlackRockLoader":
+    def load_online_spikes(self, nev_path: str | Path | None = None) -> "BlackRockLoader":
         """
         Load online spike timing (HUB-*.nev). Populates self.spike_times
         (seconds), self.spike_channel and self.spike_unit, ready for
-        segment_spikes / export_spikes.
+        segment_spikes / export_online_spikes. If the loader was built with
+        load_online_wave=True, also populates self.spike_waveform (microVolts,
+        shape (nSpikes, nSamp)) for segment_waveforms / export_online_wave.
         """
         nev_path = Path(nev_path) if nev_path is not None else self.spike_nev_path
         if nev_path is None:
-            raise RuntimeError("No spike file resolved; construct with load_spikes=True.")
+            raise RuntimeError(
+                "No spike file resolved; construct with load_online_spikes=True "
+                "(or load_online_wave=True)."
+            )
         if self.verbose:
             print(f"Loading spikes: {nev_path.name}")
 
-        times_s, channel, unit = self._read_spikes(nev_path)
+        times_s, channel, unit, waveform, n_dropped = self._read_online_spikes(
+            nev_path,
+            read_waveforms=self.load_online_wave,
+            include_unsorted=self.include_unsorted,
+        )
         self.spike_times = times_s
         self.spike_channel = channel
         self.spike_unit = unit
+        self.spike_waveform = waveform
 
         if self.verbose:
-            print(f"  {len(times_s)} spikes loaded")
+            msg = f"  {len(times_s)} spikes loaded"
+            if n_dropped:
+                msg += f" (dropped {n_dropped} unsorted/noise)"
+            if waveform is not None:
+                msg += f" (waveforms {waveform.shape[1]} samples/spike)"
+            print(msg)
 
         return self
 
@@ -537,19 +589,25 @@ class BlackRockLoader:
             )
         return self.analog_mat_path
 
-    def export_spikes(self) -> Path:
+    def export_online_spikes(self) -> Path | None:
         """
         Rasterize online spikes into per-trial bins and save as a .mat file.
-        Must be called after load_nev() and load_spikes().
+        Must be called after load_nev() and load_online_spikes(). Returns None
+        (and writes nothing) when there are no spikes to export — e.g. all were
+        unsorted/noise and dropped (include_unsorted=False).
 
         Returns
         -------
-        spikes_mat_path
+        spikes_mat_path or None
         """
         if self.trials is None:
-            raise RuntimeError("Call load_nev() before export_spikes().")
+            raise RuntimeError("Call load_nev() before export_online_spikes().")
         if self.spike_times is None:
-            raise RuntimeError("Call load_spikes() before export_spikes().")
+            raise RuntimeError("Call load_online_spikes() before export_online_spikes().")
+        if len(self.spike_times) == 0:
+            if self.verbose:
+                print("  No sorted spikes found; skipping spike export.")
+            return None
 
         from scipy.io import savemat
 
@@ -572,10 +630,90 @@ class BlackRockLoader:
             )
         return self.spikes_mat_path
 
+    def export_online_wave(self) -> Path | None:
+        """
+        Segment per-spike waveforms into per-trial slices and save as a .mat
+        file. Must be called after load_nev() and load_online_spikes() with the loader
+        built using load_online_wave=True.
+
+        The dense waveform array (units x trials x spikes x samples) easily
+        exceeds scipy savemat's 4 GB MAT-v5 limit, so the file is written as
+        MATLAB **v7.3** (HDF5) via hdf5storage, mirroring the MATLAB loader's
+        `-v7.3` save. Large arrays are gzip-compressed (the NaN padding
+        compresses well), so the file on disk is far smaller than the in-memory
+        array.
+
+        Returns
+        -------
+        waveforms_mat_path or None
+            None (and nothing written) when there are no spikes to export — e.g.
+            all were unsorted/noise and dropped (include_unsorted=False).
+        """
+        if self.trials is None:
+            raise RuntimeError("Call load_nev() before export_online_wave().")
+        if self.spike_waveform is None:
+            raise RuntimeError(
+                "No waveforms loaded; construct with load_online_wave=True and "
+                "call load_online_spikes() before export_online_wave()."
+            )
+        if len(self.spike_waveform) == 0:
+            if self.verbose:
+                print("  No sorted spikes found; skipping waveform export.")
+            return None
+
+        online_spike_waveform = segment_waveforms(
+            self.trials,
+            self.spike_times,
+            self.spike_channel,
+            self.spike_unit,
+            self.spike_waveform,
+            self.pre_ms,
+            self.post_ms,
+        )
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._savemat_v73(
+            self.waveforms_mat_path,
+            {"online_spike_waveform": online_spike_waveform},
+        )
+        if self.verbose:
+            w = online_spike_waveform["waveform"]
+            print(
+                f"  Waveforms segmented ({w.shape[0]} units x {w.shape[1]} trials "
+                f"x {w.shape[2]} spikes x {w.shape[3]} samples) "
+                f"-> {self.waveforms_mat_path.name}"
+            )
+        return self.waveforms_mat_path
+
+    @staticmethod
+    def _savemat_v73(path: Path, mdict: dict) -> None:
+        """Write ``mdict`` as a MATLAB **v7.3** (HDF5) .mat file via hdf5storage.
+
+        Used for the spike-waveform export, whose dense array routinely exceeds
+        scipy savemat's 4 GB MAT-v5 (uint32 byte-count) limit. ``oned_as='row'``
+        and row char strings match the scipy-based analog/spike exporters, so
+        MATLAB sees the same field orientations; ``store_python_metadata=False``
+        keeps the struct clean (no extra Python-type fields)."""
+        try:
+            import hdf5storage
+        except ImportError as e:
+            raise ImportError(
+                "Saving spike waveforms needs MATLAB v7.3 (HDF5) support, which "
+                "requires the hdf5storage package. Install it with:\n"
+                "  pip install hdf5storage"
+            ) from e
+        hdf5storage.savemat(
+            str(path),
+            mdict,
+            format="7.3",
+            store_python_metadata=False,
+            oned_as="row",
+            truncate_existing=True,
+        )
+
     def run(self) -> tuple[Path, list[str]]:
         """
         Convenience: load_nev() + export(), then analog/spikes if their files
-        were resolved at construction (load_analog / load_spikes).
+        were resolved at construction (load_analog / load_online_spikes).
 
         Returns
         -------
@@ -590,9 +728,18 @@ class BlackRockLoader:
             self.export_analog()
             filenames.append(self.analog_mat_path.name)
         if self.spike_nev_path is not None:
-            self.load_spikes()
-            self.export_spikes()
-            filenames.append(self.spikes_mat_path.name)
+            self.load_online_spikes()
+            if self.spike_times is None or len(self.spike_times) == 0:
+                # Everything was unsorted/noise (include_unsorted=False) -> nothing to export.
+                if self.verbose:
+                    print("  No sorted spikes found; skipping spike/waveform export.")
+            else:
+                if self._export_online_spikes:
+                    self.export_online_spikes()
+                    filenames.append(self.spikes_mat_path.name)
+                if self.load_online_wave:
+                    self.export_online_wave()
+                    filenames.append(self.waveforms_mat_path.name)
         return self.output_dir, filenames
 
     @classmethod
@@ -604,7 +751,9 @@ class BlackRockLoader:
         data_type: str = "raw_data",
         load_analog: bool = False,
         ns_marker: str = "ns2",
-        load_spikes: bool = False,
+        load_online_spikes: bool = False,
+        load_online_wave: bool = False,
+        include_unsorted: bool = False,
         pre_ms: float = C.SEGMENT_PRE_MS,
         post_ms: float = C.SEGMENT_POST_MS,
         bin_ms: float = C.SEGMENT_BIN_MS,
@@ -627,8 +776,8 @@ class BlackRockLoader:
             A year-month-date string, a list of them, or None/empty to discover
             and process every ``YYYY-MM-DD`` folder under
             ``session_path / data_type`` (sorted).
-        data_type, load_analog, ns_marker, load_spikes, pre_ms, post_ms, bin_ms,
-        output_folder, verbose
+        data_type, load_analog, ns_marker, load_online_spikes, load_online_wave,
+        include_unsorted, pre_ms, post_ms, bin_ms, output_folder, verbose
             Forwarded to each per-date loader (see BlackRockLoader).
         skip_existing : bool
             Skip dates whose expmeta .txt and trials .csv already exist, so a
@@ -663,7 +812,9 @@ class BlackRockLoader:
                     data_type=data_type,
                     load_analog=load_analog,
                     ns_marker=ns_marker,
-                    load_spikes=load_spikes,
+                    load_online_spikes=load_online_spikes,
+                    load_online_wave=load_online_wave,
+                    include_unsorted=include_unsorted,
                     pre_ms=pre_ms,
                     post_ms=post_ms,
                     bin_ms=bin_ms,
@@ -758,9 +909,24 @@ class BlackRockLoader:
         times_s = [t / self._tick_rate for t in deduped_ticks]
         return deduped_comments, times_s
 
-    def _read_spikes(self, nev_path: Path):
-        """Open the NEV file via brpylib and extract online spike timing.
-        Returns (times_s, channel, unit). Raises ValueError if no spikes."""
+    def _read_online_spikes(
+        self,
+        nev_path: Path,
+        read_waveforms: bool = False,
+        include_unsorted: bool = False,
+    ):
+        """Online spike reader: open the HUB NEV via brpylib and extract spike
+        timing into the common per-spike representation.
+
+        Returns (times_s, channel, unit, waveform, n_dropped) — the same shape a
+        future ``_read_offline_spikes`` would return, so both feed the shared
+        ``segment_spikes`` / ``segment_waveforms``. ``waveform`` is None unless
+        ``read_waveforms`` is True, in which case it is an (nSpikes, nSamp) array
+        of microVolts (raw int16 scaled per electrode, like the MATLAB version).
+        When ``include_unsorted`` is False, spikes whose unit is in
+        C.UNSORTED_UNIT_IDS (0 unsorted, 255 noise) are dropped via the shared
+        ``drop_units`` helper before scaling (the memory saver); ``n_dropped``
+        counts how many were removed. Raises ValueError if no spikes."""
         import numpy as np
         if not hasattr(np.chararray, "tostring"):
             np.chararray.tostring = np.chararray.tobytes  # type: ignore[attr-defined]
@@ -774,7 +940,9 @@ class BlackRockLoader:
             ) from e
 
         nev = NevFile(str(nev_path))
-        data = nev.getdata(elec_ids="all", wave_read="no_read")
+        data = nev.getdata(
+            elec_ids="all", wave_read="read" if read_waveforms else "no_read"
+        )
         tick_rate = nev.basic_header["TimeStampResolution"]
 
         spikes = data.get("spike_events", {})
@@ -787,4 +955,54 @@ class BlackRockLoader:
         times_s = np.asarray(raw_ticks, dtype=float) / tick_rate
         channel = np.asarray(spikes.get("Channel", []), dtype=float)
         unit = np.asarray(spikes.get("Unit", []), dtype=float)
-        return times_s, channel, unit
+
+        # raw int16 waveforms (kept int until after masking to save memory)
+        raw = None
+        if read_waveforms:
+            raw = spikes.get("Waveforms")
+            if raw is None:
+                raise ValueError(
+                    "Spike NEV has no waveform data (wave_read returned none); "
+                    "this file may have been recorded without online waveforms."
+                )
+            raw = np.asarray(raw)  # (nSpikes, nSamp), int16
+
+        # Drop unsorted (unit 0) / noise (unit 255) before the float scaling so
+        # the dense waveform array only ever holds sorted units. drop_units is
+        # the shared, source-agnostic filter (a future offline reader reuses it).
+        n_dropped = 0
+        if not include_unsorted:
+            times_s, channel, unit, raw, n_dropped = drop_units(
+                times_s, channel, unit, raw
+            )
+
+        waveform = None
+        if read_waveforms:
+            waveform = self._scale_waveforms(nev, raw, channel)
+        return times_s, channel, unit, waveform, n_dropped
+
+    @staticmethod
+    def _scale_waveforms(nev, raw, channel) -> "np.ndarray":  # noqa: F821
+        """Convert raw int16 spike waveforms to microVolts.
+
+        ``raw`` is the (nSpikes, nSamp) int16 array from
+        ``spike_events["Waveforms"]`` (already masked by the caller). Each
+        electrode's NEUEVWAV extended header carries a DigitizationFactor
+        (nV/bit); microVolts = raw * DigitizationFactor / 1000, matching the
+        MATLAB BlackrockLoader (DigitalFactor / 1000)."""
+        import numpy as np
+
+        raw = np.asarray(raw, dtype=float)  # (nSpikes, nSamp)
+
+        # electrode id -> DigitizationFactor (nV/bit) from NEUEVWAV headers
+        factor_map = {
+            h["ElectrodeID"]: h["DigitizationFactor"]
+            for h in nev.extended_headers
+            if "ElectrodeID" in h and "DigitizationFactor" in h
+        }
+        channel = np.asarray(channel, dtype=float)
+        factors = np.array(
+            [factor_map.get(int(c), 0.0) for c in channel], dtype=float
+        )
+        # microVolts = raw int16 * (nV/bit) / 1000
+        return raw * factors[:, None] / 1000.0

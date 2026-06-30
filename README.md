@@ -14,23 +14,34 @@ file by its role (mirroring the MATLAB `BlackrockLoader`):
 - `NSP-*.nev` → behavioral trial event comments, parsed into a trial-based structure
 - `NSP-*.ns2` → analog (eye) data, segmented per trial
 - `HUB-*.nev` → online spike timing, rasterized per trial (also the **legacy fallback** for comments)
+- `HUB-*.nev` → online spike **waveforms**, segmented per trial (opt-in `load_online_wave=True`)
 
 Outputs (written to `export_data/<Date>/`):
 
 - `Blackrock_YYYY-MM-DD_expmeta.txt` — experiment metadata (one key: value per line)
 - `Blackrock_YYYY-MM-DD_trials.csv` — per-trial behavioral data with derived features
 - `Blackrock_YYYY-MM-DD_analog.mat` — analog segmented into trials (`load_analog=True`)
-- `Blackrock_YYYY-MM-DD_spikes.mat` — online spikes rasterized into trials (`load_spikes=True`)
+- `Blackrock_YYYY-MM-DD_spikes.mat` — online spikes rasterized into trials (`load_online_spikes=True`)
+- `Blackrock_YYYY-MM-DD_waveforms.mat` — per-spike waveforms segmented into trials (`load_online_wave=True`)
 
-The two segmented `.mat` files hold a struct with `data` (channels/units × trials ×
+The analog/spike segmented `.mat` files hold a struct with `data` (channels/units × trials ×
 samples/bins, NaN-padded), `timeseq` (`alignedrawtime`, `aligned_marker`,
 `relative_time`), and `info` (`samplingrate`, `Session`, `Trial_number`, plus
 `Channel_Number`/`Unit_No` for spikes) — byte-for-byte aligned with the MATLAB output.
+The waveform `.mat` mirrors the MATLAB `segmentSpikeWaveforms` struct instead: `waveform`
+(units × trials × spikes × samples, µV, NaN-padded), `waveform_time`, `waveform_nsamp`,
+`waveform_unit`, plus `timeseq` and `info`. `load_online_wave` reads the same `HUB-*.nev` as
+spikes, so it implies reading spikes; it is off by default because the dense array is large.
+The waveform file is written as MATLAB **v7.3** (HDF5, via `hdf5storage`) — the dense array
+routinely exceeds scipy's 4 GB MAT-v5 limit, so this mirrors the MATLAB loader's `-v7.3`
+save. Large arrays are gzip-compressed, so the file on disk is far smaller than the array.
 
 ## Requirements
 
 - Python ≥ 3.11
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
+- `hdf5storage` (+ `h5py`) — pulled in automatically; needed only for the
+  `load_online_wave` export, which writes a MATLAB v7.3 (HDF5) file
 
 ## Installation
 
@@ -96,8 +107,9 @@ Your data must be laid out like this:
             └── <Date>/
                 ├── Blackrock_<Date>_expmeta.txt
                 ├── Blackrock_<Date>_trials.csv
-                ├── Blackrock_<Date>_analog.mat   ← if load_analog=True
-                └── Blackrock_<Date>_spikes.mat   ← if load_spikes=True
+                ├── Blackrock_<Date>_analog.mat    ← if load_analog=True
+                ├── Blackrock_<Date>_spikes.mat    ← if load_online_spikes=True
+                └── Blackrock_<Date>_waveforms.mat ← if load_online_wave=True
 ```
 
 Build the **session path** from your own folder structure, then pass it with the
@@ -127,7 +139,9 @@ Defaults you can override in the constructor:
 | `data_type` | `"raw_data"` | name of the raw-data sub-folder |
 | `output_folder` | `"export_data"` | name of the export sub-folder |
 | `load_analog` | `False` | load + segment the `NSP-*.ns2` analog file |
-| `load_spikes` | `False` | load + rasterize online spikes from the `HUB-*.nev` file |
+| `load_online_spikes` | `False` | load + rasterize online spikes from the `HUB-*.nev` file |
+| `load_online_wave` | `False` | also segment per-spike waveforms (µV) from the `HUB-*.nev` file; implies reading spikes |
+| `include_unsorted` | `False` | keep unsorted (unit 0) + noise (255) online spikes. Default `False` → only sorted units 1–5 are exported (applies to **both** spikes and waveforms) |
 | `ns_marker` | `"ns2"` | NSx analog extension (use `"ns6"` etc. for other rates) |
 | `nev_filename` | auto | pick a specific comment `.nev` instead of the `NSP-*` auto-pick |
 | `ns_filename` | auto | pick a specific NSx file instead of the `NSP-*` auto-pick |
@@ -150,7 +164,8 @@ BlackRockLoader.list_nev_files(Session_Path, Date)
 loader = BlackRockLoader(
     Session_Path, Date,
     load_analog=True,        # segment the NSP-*.ns2 analog (eye-tracking) file
-    load_spikes=True,        # rasterize online spikes from the HUB-*.nev file
+    load_online_spikes=True,  # rasterize online spikes from the HUB-*.nev file
+    load_online_wave=True,     # also segment per-spike waveforms (µV) from the HUB-*.nev file
     # nev_filename="...",    # optional: pick a specific comment .nev (else largest NSP-*)
     # ns_marker="ns2",       # NSx extension to load; default "ns2", e.g. "ns6"
     # ns_filename="...",     # optional: pick a specific NSx file
@@ -204,7 +219,7 @@ report = BlackRockLoader.run_batch(Session_Path, dates=["2026-06-17", "2026-06-1
 
 # Every date folder under raw_data/, also exporting analog + spikes, skipping already-done dates
 report = BlackRockLoader.run_batch(
-    Session_Path, load_analog=True, load_spikes=True, skip_existing=True
+    Session_Path, load_analog=True, load_online_spikes=True, skip_existing=True
 )
 
 for r in report:
@@ -245,7 +260,9 @@ Done: 2 ok, 0 skipped, 1 failed
 | `dates` | `None` | List of dates, or `None`/empty to auto-discover every `YYYY-MM-DD` folder |
 | `skip_existing` | `False` | Skip dates whose `_expmeta.txt` **and** `_trials.csv` already exist |
 | `load_analog` | `False` | Also segment + export the `NSP-*.ns2` analog file for each date |
-| `load_spikes` | `False` | Also rasterize + export online spikes from the `HUB-*.nev` file |
+| `load_online_spikes` | `False` | Also rasterize + export online spikes from the `HUB-*.nev` file |
+| `load_online_wave` | `False` | Also segment + export per-spike waveforms from the `HUB-*.nev` file |
+| `include_unsorted` | `False` | Keep unsorted (unit 0) + noise (255) spikes; default `False` → sorted units only |
 | `ns_marker` | `"ns2"` | NSx extension to load when `load_analog=True` |
 | `pre_ms`, `post_ms` | `500` | Trial-segmentation buffers (ms) |
 | `bin_ms` | `1` | Spike-raster bin width (ms) |
@@ -329,6 +346,28 @@ same `timeseq` layout as above, plus:
 | `info.samplingrate` | — | bin rate (Hz), 1000 for 1 ms bins |
 | `info.Channel_Number`, `info.Unit_No` | units | electrode / unit id per raster row |
 
+By default rows are restricted to **sorted units** (unit 0 unsorted + unit 255 noise are
+dropped); pass `include_unsorted=True` to keep all units.
+
+### `_waveforms.mat`
+Per-spike waveforms segmented into trials. A MATLAB struct `online_spike_waveform`
+mirroring `segmentSpikeWaveforms`. Rows are the same `(channel, unit)` order as
+`_spikes.mat`, so waveform rows line up 1:1 with the raster rows. The raw int16 waveforms
+are scaled to µV per electrode (`DigitizationFactor / 1000`), like the MATLAB loader.
+Keeping only sorted units (the `include_unsorted=False` default) is what keeps this dense
+array small / the v7.3 file from getting huge; `include_unsorted=True` restores all units.
+
+| Field | Shape | Description |
+|---|---|---|
+| `waveform` | units × trials × spikes × samples | per-spike waveform (µV), NaN-padded to the busiest `(unit, trial)` spike count |
+| `waveform_time` | units × trials × spikes | each spike's time (s) relative to the `Start` marker |
+| `waveform_nsamp` | — | samples per waveform |
+| `waveform_unit` | — | `"microVolts"` |
+| `timeseq.alignedrawtime` | trials | absolute time (s) of each trial's `Start` marker |
+| `timeseq.aligned_marker` | — | `"Start"` (waveform_time = 0 at the Start marker) |
+| `info.Channel_Number`, `info.Unit_No` | units | electrode / unit id per row |
+| `info.maxSpikes` | — | spike-dimension length (busiest unit-trial in-window count) |
+
 ## Step-by-step API (if you want to do some basic analysis directly after exporting)
 
 ```python
@@ -336,7 +375,8 @@ from pathlib import Path
 from jlab import BlackRockLoader
 
 Session_Path = Path("/path/to/your/Data") / "Monkey Porthos" / "in_lab"
-loader = BlackRockLoader(Session_Path, "2026-06-17", load_analog=True, load_spikes=True)
+loader = BlackRockLoader(Session_Path, "2026-06-17", load_analog=True,
+                         load_online_spikes=True, load_online_wave=True)
 
 # Step 1 — load and parse the comment NEV file
 loader.load_nev()
@@ -348,15 +388,20 @@ loader.export()
 loader.load_analog()
 loader.export_analog()
 
-# Step 4 — rasterize + export online spikes (optional; needs load_spikes=True)
-loader.load_spikes()
-loader.export_spikes()
+# Step 4 — rasterize + export online spikes (optional; needs load_online_spikes=True)
+# load_online_spikes() also reads per-spike waveforms when load_online_wave=True.
+loader.load_online_spikes()
+loader.export_online_spikes()
+
+# Step 5 — segment + export per-spike waveforms (optional; needs load_online_wave=True)
+loader.export_online_wave()
 
 # Access parsed data directly
 loader.experiments   # list of experiment-metadata dicts (one per session)
 loader.trials        # list of per-trial dicts
 loader.analog        # raw brpylib dict ('data', 'elec_ids', 'samp_per_s', ...)
 loader.spike_times   # spike timestamps (s); also spike_channel / spike_unit
+loader.spike_waveform # per-spike waveforms (µV, nSpikes × nSamp) if load_online_wave=True
 ```
 
 ## Project structure
@@ -369,7 +414,8 @@ JLab_Python/
 │   ├── _features.py     # derived feature computation (angles, eccentricity)
 │   ├── _exporter.py     # writes .txt and .csv files
 │   ├── _analog.py       # segment_analog — analog stream → per-trial 3D array
-│   ├── _spikes.py       # segment_spikes — online spikes → per-trial raster
+│   ├── _spikes.py       # segment_spikes + drop_units — source-agnostic spike align/filter
+│   ├── _waveforms.py    # segment_waveforms — per-spike waveforms → per-trial 4D array
 │   └── _constants.py    # file schema, event maps, regex patterns
 ├── brpylib/             # bundled Blackrock file reader
 ├── notebooks/
@@ -377,3 +423,24 @@ JLab_Python/
 │   └── 02_psychometric_analysis.ipynb
 └── pyproject.toml
 ```
+
+## Extending to offline spikes
+
+The spike pipeline is **source-agnostic** so online and offline (sorted) spikes can share it
+— only the *reader* differs:
+
+```
+reader  →  common per-spike arrays (times, channel, unit[, waveform])  →  segment_*  →  export
+```
+
+- **Shared (already source-agnostic):** `segment_spikes` and `segment_waveforms`
+  (`jlab/_spikes.py`, `jlab/_waveforms.py`) align loose per-spike arrays to trials with no
+  knowledge of where they came from; `drop_units` (`jlab/_spikes.py`) is the shared
+  unsorted/noise filter (defaults to ids `0`/`255`, overridable via `drop_ids`).
+- **Source-specific (today):** `BlackRockLoader._read_online_spikes` reads the online HUB
+  NEV into those arrays.
+- **To add offline later:** write a parallel `_read_offline_spikes` (from the sorted-spike
+  source) that returns the same `(times, channel, unit[, waveform])`, plus
+  `load_offline_spikes` / `export_offline_spikes` methods that reuse the **same**
+  `segment_*` + `drop_units` and write `offline_spike` / `offline_spike_waveform` outputs.
+  No change to the segmentation code is needed.

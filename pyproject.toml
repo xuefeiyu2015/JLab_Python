@@ -10,6 +10,7 @@ dependencies = [
     "scipy>=1.17.1",
     "matplotlib>=3.10.9",
     "jupyterlab>=4.5.8",
+    "hdf5storage>=0.2",   # MATLAB v7.3 (HDF5) save for the spike-waveform export
 ]
 
 [tool.setuptools.packages.find]

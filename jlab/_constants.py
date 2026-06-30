@@ -7,11 +7,16 @@ import re
 # file by its prefix and verifies the expected data is present before using it.
 COMMENT_PREFIX_PRIMARY = "NSP"   # NSP-*.nev: comments + comment timing
 COMMENT_PREFIX_LEGACY = "HUB"    # HUB-*.nev: legacy fallback for comments
-SPIKE_PREFIX = "HUB"             # HUB-*.nev: online spike timing
+SPIKE_PREFIX = "HUB"             # HUB-*.nev: online spike timing + waveforms
 ANALOG_PREFIX = "NSP"            # NSP-*.ns2: analog/eye data
+
+# Online-spike "unit" ids that are not sorted single units: 0 = unsorted
+# threshold crossings, 255 = noise/invalidated. Dropped unless include_unsorted=True.
+UNSORTED_UNIT_IDS = (0, 255)
 
 # ── Trial-segmentation defaults (ms) ───────────────────────────────────────
 # Window per trial = [Start - pre, End + post]; spikes binned at bin width.
+# Waveforms reuse the same pre/post window (one waveform per in-window spike).
 SEGMENT_PRE_MS = 500
 SEGMENT_POST_MS = 500
 SEGMENT_BIN_MS = 1
