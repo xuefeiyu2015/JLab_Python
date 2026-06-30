@@ -1,7 +1,11 @@
 """
-Online-spike trial segmentation.
-Rasterizes online spikes into one binary slice per trial, mirroring
-BlackrockLoader.segmentSpikes in the MATLAB version.
+Spike trial segmentation (source-agnostic).
+Rasterizes spikes into one binary slice per trial, mirroring
+BlackrockLoader.segmentSpikes in the MATLAB version. ``segment_spikes`` and the
+shared ``drop_units`` helper take only loose arrays
+(``spike_times/channel/unit``), so they work for any spike source — online
+(HUB NEV) today, offline (sorted) later — differing only in the reader that
+produces those arrays.
 """
 
 from __future__ import annotations
@@ -10,7 +14,12 @@ import math
 
 import numpy as np
 
-from ._constants import SEGMENT_BIN_MS, SEGMENT_POST_MS, SEGMENT_PRE_MS
+from ._constants import (
+    SEGMENT_BIN_MS,
+    SEGMENT_POST_MS,
+    SEGMENT_PRE_MS,
+    UNSORTED_UNIT_IDS,
+)
 
 
 def _isnan(v) -> bool:
@@ -18,6 +27,48 @@ def _isnan(v) -> bool:
         return math.isnan(v)
     except (TypeError, ValueError):
         return False
+
+
+def drop_units(
+    spike_times: np.ndarray,
+    spike_channel: np.ndarray,
+    spike_unit: np.ndarray,
+    spike_waveform: np.ndarray | None = None,
+    *,
+    drop_ids=UNSORTED_UNIT_IDS,
+):
+    """Drop spikes whose unit id is in ``drop_ids`` (default: unsorted 0 + noise 255).
+
+    Source-agnostic filter shared by every spike reader: it applies one keep-mask
+    ``~np.isin(spike_unit, drop_ids)`` across the parallel per-spike arrays so
+    they stay index-aligned. A future offline reader can reuse this (passing its
+    own ``drop_ids`` if its "unsorted/noise" convention differs).
+
+    Parameters
+    ----------
+    spike_times, spike_channel, spike_unit : np.ndarray
+        Parallel per-spike arrays (one entry per spike).
+    spike_waveform : np.ndarray or None
+        Optional (nSpikes, nSamp) per-spike waveform array, filtered along axis 0.
+        Stays ``None`` when not provided.
+    drop_ids : iterable
+        Unit ids to remove. Empty -> drops nothing.
+
+    Returns
+    -------
+    (spike_times, spike_channel, spike_unit, spike_waveform, n_dropped)
+        Filtered arrays (``spike_waveform`` is ``None`` if it was ``None``) and
+        the number of spikes removed.
+    """
+    spike_unit = np.asarray(spike_unit)
+    keep = ~np.isin(spike_unit, np.asarray(drop_ids))
+    n_dropped = int((~keep).sum())
+    spike_times = np.asarray(spike_times)[keep]
+    spike_channel = np.asarray(spike_channel)[keep]
+    spike_unit = spike_unit[keep]
+    if spike_waveform is not None:
+        spike_waveform = np.asarray(spike_waveform)[keep]
+    return spike_times, spike_channel, spike_unit, spike_waveform, n_dropped
 
 
 def segment_spikes(
@@ -30,7 +81,11 @@ def segment_spikes(
     bin_ms: float = SEGMENT_BIN_MS,
 ) -> dict:
     """
-    Rasterize online spikes into one binary slice per trial.
+    Rasterize spikes into one binary slice per trial.
+
+    Source-agnostic: operates purely on the ``spike_times/channel/unit`` arrays,
+    so it is the shared "align to trials" stage for any spike source (online HUB
+    NEV now, offline sorted spikes later).
 
     Port of BlackrockLoader.segmentSpikes. For each trial the window is
     ``[Start - pre_ms, End + post_ms]`` (ms buffers), matched against
