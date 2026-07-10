@@ -1,4 +1,4 @@
-# Python Package:  jlab
+# Python Package:  jlab_loader
 
 Python package for loading and exporting Blackrock NEV/NSx data from JLab experiments.
 Replicates the output of `BackRockFileLoader.m` / `BlackrockLoader.m` [Matlab Version](https://github.com/xuefeiyu2015/JLab) — same parsing schema, segmentation, and output products.
@@ -117,7 +117,7 @@ date:
 
 ```python
 from pathlib import Path
-from jlab import BlackRockLoader
+from jlab_loader import BlackRockLoader
 
 # ── Edit these for your machine ─────────────────────────────────────────────
 Basic_Path = "/path/to/your/Data"   # root data folder
@@ -153,7 +153,7 @@ Defaults you can override in the constructor:
 
 ```python
 from pathlib import Path
-from jlab import BlackRockLoader
+from jlab_loader import BlackRockLoader
 
 Session_Path = Path("/path/to/your/Data") / "Monkey Porthos" / "in_lab"
 Date = "2026-06-17"
@@ -210,7 +210,7 @@ same load + export pipeline, and returns a summary list.
 
 ```python
 from pathlib import Path
-from jlab import BlackRockLoader
+from jlab_loader import BlackRockLoader
 
 Session_Path = Path("/path/to/your/Data") / "Monkey Porthos" / "in_lab"
 
@@ -372,7 +372,7 @@ array small / the v7.3 file from getting huge; `include_unsorted=True` restores 
 
 ```python
 from pathlib import Path
-from jlab import BlackRockLoader
+from jlab_loader import BlackRockLoader
 
 Session_Path = Path("/path/to/your/Data") / "Monkey Porthos" / "in_lab"
 loader = BlackRockLoader(Session_Path, "2026-06-17", load_analog=True,
@@ -408,7 +408,7 @@ loader.spike_waveform # per-spike waveforms (µV, nSpikes × nSamp) if load_onli
 
 ```
 JLab_Python/
-├── jlab/
+├── jlab_loader/
 │   ├── loader.py        # BlackRockLoader — main user-facing class
 │   ├── _parser.py       # event comment parsing
 │   ├── _features.py     # derived feature computation (angles, eccentricity)
@@ -434,8 +434,8 @@ reader  →  common per-spike arrays (times, channel, unit[, waveform])  →  se
 ```
 
 - **Shared (already source-agnostic):** `segment_spikes` and `segment_waveforms`
-  (`jlab/_spikes.py`, `jlab/_waveforms.py`) align loose per-spike arrays to trials with no
-  knowledge of where they came from; `drop_units` (`jlab/_spikes.py`) is the shared
+  (`jlab_loader/_spikes.py`, `jlab_loader/_waveforms.py`) align loose per-spike arrays to trials with no
+  knowledge of where they came from; `drop_units` (`jlab_loader/_spikes.py`) is the shared
   unsorted/noise filter (defaults to ids `0`/`255`, overridable via `drop_ids`).
 - **Source-specific (today):** `BlackRockLoader._read_online_spikes` reads the online HUB
   NEV into those arrays.

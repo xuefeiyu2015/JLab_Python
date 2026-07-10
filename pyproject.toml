@@ -1,5 +1,5 @@
 [project]
-name = "jlab"
+name = "jlab_loader"
 version = "0.1.0"
 description = "Blackrock NEV file loader for JLab neuroscience experiments"
 readme = "README.md"
@@ -15,4 +15,4 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["jlab*", "brpylib*"]
+include = ["jlab_loader*", "brpylib*"]
