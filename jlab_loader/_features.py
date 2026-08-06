@@ -1,6 +1,7 @@
 """
 Derived feature computation.
-Mirrors the feature block in BackRockFileLoader.m (lines 518-550).
+Port of BlackrockLoader.addDerivedTrialFeatures: relabel memory-type visual
+saccades, then append the seven derived geometry/choice fields.
 All functions mutate the trials list in-place.
 """
 
@@ -28,23 +29,51 @@ def _eccentricity(x: float, y: float) -> float:
 
 
 # Names of fields added by compute_derived_features(), in output order.
+# This is the order MATLAB's addDerivedTrialFeatures appends them in
+# (BlackrockLoader.m:2871-2889), and it drives the CSV column order — the
+# eccentricities come LAST, after the choice fields, not paired with the angles.
 # Add new derived field names here when extending the function below.
 DERIVED_FIELDS: list[str] = [
     "Target_1_angle",
-    "Target_1_eccentricity",
     "Target_2_angle",
-    "Target_2_eccentricity",
     "Stimulus_direction",
     "Choose_target",
     "Choose_leftright",
+    "Target_1_eccentricity",
+    "Target_2_eccentricity",
 ]
+
+
+def relabel_memory_saccades(trials: list[dict]) -> None:
+    """
+    Rewrite Task to 'memory_saccades_experiment' for memory-type visual saccades.
+
+    Port of the head of BlackrockLoader.addDerivedTrialFeatures
+    (BlackrockLoader.m:2838-2846):
+
+        memory_idx = strcmp(trial_type, 'memory');
+        task_idx   = strcmp(tasks, 'visual_saccades_experiment');
+        tasks(memory_idx & task_idx) = {'memory_saccades_experiment'};
+
+    BOTH conditions must hold — a 'memory' trial recorded under some other task
+    name is left alone. Runs before the geometry/choice fields, matching MATLAB.
+    """
+    for trial in trials:
+        if (
+            trial.get("Trial_type") == "memory"
+            and trial.get("Task") == "visual_saccades_experiment"
+        ):
+            trial["Task"] = "memory_saccades_experiment"
 
 
 def compute_derived_features(trials: list[dict]) -> None:
     """
-    Add Target_1/2_angle, Target_1/2_eccentricity, Stimulus_direction,
-    Choose_target, Choose_leftright to each trial dict.
+    Relabel memory-type visual saccades, then add Target_1/2_angle,
+    Target_1/2_eccentricity, Stimulus_direction, Choose_target and
+    Choose_leftright to each trial dict.
     """
+    relabel_memory_saccades(trials)
+
     for trial in trials:
         t1x, t1y = trial.get("Target_1_position", [math.nan, math.nan])
         t2x, t2y = trial.get("Target_2_position", [math.nan, math.nan])
@@ -76,12 +105,15 @@ def compute_derived_features(trials: list[dict]) -> None:
             choose_target = math.nan
         trial["Choose_target"] = choose_target
 
-        # Choose_leftright: +1 if chosen target is on the right, -1 if left
-        if not math.isnan(choose_target):
-            chosen_angle = t1_angle if choose_target == 1 else t2_angle
-            if not math.isnan(chosen_angle):
-                trial["Choose_leftright"] = 1 if chosen_angle >= 0 else -1
-            else:
-                trial["Choose_leftright"] = math.nan
-        else:
-            trial["Choose_leftright"] = math.nan
+        # Choose_leftright: +1 if the chosen target is on the right, -1 if left.
+        # MATLAB seeds this from Choose_target and only overwrites the 1 and 2
+        # cases (BlackrockLoader.m:2866-2868), so a stray Choose_target of 3
+        # passes straight through. It also does NOT guard against a NaN angle:
+        # in MATLAB `NaN >= 0` is false, so `(angle >= 0)*2 - 1` yields -1, not
+        # NaN. Both quirks are reproduced here deliberately.
+        choose_leftright = choose_target
+        if choose_target == 1:
+            choose_leftright = 1 if t1_angle >= 0 else -1
+        elif choose_target == 2:
+            choose_leftright = 1 if t2_angle >= 0 else -1
+        trial["Choose_leftright"] = choose_leftright

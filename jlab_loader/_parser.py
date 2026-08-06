@@ -6,6 +6,7 @@ that match the MATLAB BackRockFileLoader.m output exactly.
 from __future__ import annotations
 
 import math
+import warnings
 
 from ._constants import (
     DASH_EVENTS,
@@ -26,6 +27,11 @@ from ._constants import (
 )
 
 NaN = float("nan")
+
+# Trial fields whose raw clock tick is kept alongside the seconds value. The
+# segmenters use these to do window arithmetic in exact integers instead of on
+# absolute epoch doubles, where the resolution is only ~238 ns.
+TICK_FIELDS = ("Start", "End")
 
 
 def _make_empty_experiment() -> dict:
@@ -208,7 +214,6 @@ def _handle_time_event(text: str, time_s: float, trial: dict) -> bool:
         trial[field] = time_s
     else:
         trial["duplicates"].append(text)
-        print(f"Duplicate found for time event: {text}")
     return True
 
 
@@ -226,7 +231,6 @@ def _handle_info_event(text: str, time_s: float, trial: dict) -> bool:
             trial[field] = coord
         else:
             trial["duplicates"].append(field_key)
-            print(f"Duplicate found for coord event: {field_key}")
         return True
 
     # Try reward pattern: "Name(NNms ...)"
@@ -237,12 +241,10 @@ def _handle_info_event(text: str, time_s: float, trial: dict) -> bool:
             trial[field] = time_s  # save timestamp as reward start
         else:
             trial["duplicates"].append(field)
-            print(f"Duplicate found for reward event: {field_key}")
         if _is_nan(trial["Reward_amount"]):
             trial["Reward_amount"] = amount
         else:
             trial["duplicates"].append("Reward_amount")
-            print("Duplicate found for reward amount")
         return True
 
     # Try duration (ms) or size (deg)
@@ -254,7 +256,6 @@ def _handle_info_event(text: str, time_s: float, trial: dict) -> bool:
             trial[field] = dur
         else:
             trial["duplicates"].append(field)
-            print(f"Duplicate found for duration/size event: {field_key}")
         return True
 
     return True  # matched key but no pattern — skip silently
@@ -271,7 +272,6 @@ def _handle_segment_event(text: str, trial: dict) -> bool:
         trial[field] = value.strip()
     else:
         trial["duplicates"].append(field)
-        print(f"Duplicate found for segment event: {field}")
     return True
 
 
@@ -289,12 +289,10 @@ def _handle_dash_event(text: str, time_s: float, trial: dict) -> bool:
             trial["End"] = time_s
         else:
             trial["duplicates"].append(event)
-            print(f"Duplicate End found for dash event: {event}")
         if trial["Trialoutcome"] is None:
             trial["Trialoutcome"] = outcome
         else:
             trial["duplicates"].append("Trialoutcome")
-            print(f"Duplicate outcome found for dash event: {event}")
         return True
 
     if "choice" in event.lower():
@@ -302,11 +300,9 @@ def _handle_dash_event(text: str, time_s: float, trial: dict) -> bool:
             trial["Choosen_choice"] = outcome
         else:
             trial["duplicates"].append("Choosen_choice")
-            print(f"Duplicate found for dash event: {event}")
         return True
 
     # Unknown dash event
-    print(f"Undefined dash event: {text}")
     trial["undefined"].append(text)
     return True
 
@@ -318,7 +314,6 @@ def _handle_outcome_event(text: str, trial: dict) -> bool:
         trial["Choiceoutcome"] = text
     else:
         trial["duplicates"].append("Choiceoutcome")
-        print(f"Duplicate found for outcome event: {text}")
     return True
 
 
@@ -355,8 +350,104 @@ def _dispatch_trial_event(text: str, time_s: float, trial: dict) -> None:
     if _handle_offset_range_event(text, trial):
         return
     # Truly undefined
-    print(f"Undefined event detected: {text}")
     trial["undefined"].append(text)
+
+
+# ── Session labelling ──────────────────────────────────────────────────────
+
+def _session_labels_from_resets(
+    tnum_per_trial: list[int], sess_git_per_trial: list[int]
+) -> list[int]:
+    """
+    Label sessions from trial-number resets, cross-checked against the
+    "Experiment start: git commit" markers. Port of
+    BlackrockLoader.sessionLabelsFromResets.
+
+    The markers alone are not trustworthy: a file that was not saved cleanly can
+    be missing its leading metadata block, and the old marker-count rule then
+    stamped every trial of that block Session = 0 — which matters, because
+    Session is a join key downstream. Counting resets always yields 1-based
+    labels covering every trial.
+
+    '<= 0' rather than '< 0' because the trial-row rule keeps the git-session
+    term: two adjacent trial rows can share a trial number only when a marker
+    split them, which is itself a session change.
+    """
+    n = len(tnum_per_trial)
+    if n == 0:
+        return []
+
+    new_reset = [True] + [
+        tnum_per_trial[i] - tnum_per_trial[i - 1] <= 0 for i in range(1, n)
+    ]
+    session, acc = [], 0
+    for flag in new_reset:
+        acc += int(flag)
+        session.append(acc)
+
+    if max(sess_git_per_trial) == 0:
+        warnings.warn(
+            'No "Experiment start: git commit" marker precedes any trial; '
+            f"session labels derive from trial-number resets alone "
+            f"({session[-1]} session(s)).",
+            stacklevel=3,
+        )
+        return session
+
+    new_git = [True] + [
+        sess_git_per_trial[i] != sess_git_per_trial[i - 1] for i in range(1, n)
+    ]
+    if new_reset != new_git:
+        d = next(i for i in range(n) if new_reset[i] != new_git[i])
+        warnings.warn(
+            f"Session partition from trial-number resets ({session[-1]} session(s)) "
+            f"disagrees with the git-commit markers ({sum(new_git)} session(s)); "
+            f"first disagreement at trial row {d} (Trial_number "
+            f"{tnum_per_trial[d]}). Using the reset-derived labels.",
+            stacklevel=3,
+        )
+    return session
+
+
+def _reindex_experiments(
+    exp_by_marker: list[dict],
+    marker_next_row: list[int | None],
+    session: list[int],
+) -> list[dict]:
+    """
+    Re-key metadata blocks from "one per git-commit marker" to "one per Session
+    label". Port of the tail of BlackrockLoader.buildExperimentMeta.
+
+    These coincide for a clean file; they diverge when a file is missing its
+    leading metadata block, which is exactly the case the reset-derived labels
+    exist to handle. Sessions with no metadata keep a blank template entry so
+    experiments[Session - 1] is always addressable.
+    """
+    n_sess = max(session) if session else 0
+
+    sess_of_marker: list[int] = []
+    for row in marker_next_row:
+        if row is None:
+            # Trailing marker with no trials after it; give it its own session
+            # rather than dropping the metadata.
+            n_sess += 1
+            sess_of_marker.append(n_sess)
+        else:
+            sess_of_marker.append(session[row])
+
+    experiments = [_make_empty_experiment() for _ in range(n_sess)]
+    filled = [False] * n_sess
+    for m, s in enumerate(sess_of_marker):
+        if not filled[s - 1]:
+            experiments[s - 1] = exp_by_marker[m]
+            filled[s - 1] = True
+        else:
+            # Two markers inside one reset-session: keep the opening block and
+            # take the closing one's end/end_by. Only reachable when
+            # _session_labels_from_resets already warned.
+            experiments[s - 1]["end"] = exp_by_marker[m]["end"]
+            experiments[s - 1]["end_by"] = exp_by_marker[m]["end_by"]
+    return experiments
 
 
 # ── Top-level parser ───────────────────────────────────────────────────────
@@ -364,16 +455,17 @@ def _dispatch_trial_event(text: str, time_s: float, trial: dict) -> None:
 def parse_comments(
     comments: list[str],
     times_s: list[float],
-) -> tuple[list[dict], list[dict]]:
+    ticks: list[int] | None = None,
+) -> tuple[list[dict], list[dict], list[int]]:
     """
     Parse a flat list of NEV event comments into per-session experiment metadata
     and trials.
 
-    A single recording can contain several experiment sessions (the task is
-    started/ended multiple times). Each "Experiment start: git commit ..." line
-    begins a new session, so `experiments` is a list with one dict per session,
-    and every trial records which session it belongs to (`Session`, 1-based; 0
-    if the trial precedes any session start).
+    Trials are keyed by POSITION, not by number: a new trial row opens whenever
+    the parsed trial number differs from the previous trial comment's, or the
+    git-marker session changed. `Session` is then derived from trial-number
+    resets (see _session_labels_from_resets), which is 1-based and covers every
+    trial even when the recording is missing its leading metadata block.
 
     Parameters
     ----------
@@ -381,21 +473,41 @@ def parse_comments(
         Event comment strings from brpylib (data['comments']['Data']).
     times_s : list[float]
         Timestamps in seconds, one per comment.
+    ticks : list[int] or None
+        Raw integer clock ticks, one per comment. Used to record each trial's
+        Start-marker tick for the exact-tick waveform timing path.
 
     Returns
     -------
     experiments : list[dict]
-        Experiment-level metadata, one dict per session.
+        Experiment-level metadata, one dict per Session label.
     trials : list[dict]
         One dict per trial, in order of first appearance.
+    trial_ticks : dict[str, list[int]]
+        Raw clock tick of each trial's Start and End markers, keyed by field
+        name; 0 where the trial never got that marker. Feeds the exact-integer
+        window arithmetic in the segmenters.
     """
-    experiments: list[dict] = []
-    trials: list[dict] = []
-    session_index = 0  # 0 = no session started yet
-    prev_trial_num: int | None = None
-    prev_session: int | None = None
+    if ticks is None:
+        ticks = [0] * len(comments)
 
-    for text, time_s in zip(comments, times_s):
+    # ── Pass 1: classify every comment; build trial rows and git sessions ───
+    # sess_git counts "Experiment start: git commit" markers, 0 before the
+    # first, and is used ONLY to split trials that share a number across a
+    # session boundary. The exported Session comes from resets, below.
+    trials: list[dict] = []
+    trial_ticks: dict[str, list[int]] = {k: [] for k in TICK_FIELDS}
+    tnum_per_trial: list[int] = []
+    sess_git_per_trial: list[int] = []
+
+    exp_by_marker: list[dict] = []
+    marker_next_row: list[int | None] = []  # first trial row after each marker
+    sess_git = 0
+    prev_trial_num: int | None = None
+    prev_sess_git: int | None = None
+    n_undefined = 0
+
+    for text, time_s, tick in zip(comments, times_s, ticks):
         text = text.strip()
         if not text:
             continue
@@ -404,14 +516,14 @@ def parse_comments(
         m = RE_EXP.match(text)
         if m:
             marker, payload = m.group(1), m.group(2).strip()
-            # A new session begins at each "Experiment start: git commit ..." line
-            # (the first line of every metadata block within the recording).
             if marker == "start" and payload.startswith("git commit"):
-                session_index += 1
-                experiments.append(_make_empty_experiment())
-                experiments[-1]["start"] = time_s
-            if session_index >= 1:
-                _handle_exp_event(marker, payload, time_s, experiments[session_index - 1])
+                sess_git += 1
+                exp_by_marker.append(_make_empty_experiment())
+                exp_by_marker[-1]["start"] = time_s
+                marker_next_row.append(None)  # resolved when the next trial opens
+            if exp_by_marker:
+                # Metadata before the first git-commit start has nowhere to go.
+                _handle_exp_event(marker, payload, time_s, exp_by_marker[-1])
             continue
 
         # ── Trial-level event ──────────────────────────────────────────────
@@ -422,25 +534,52 @@ def parse_comments(
         trial_num = int(m.group(1))
         event_text = m.group(2).strip()
 
-        # A new trial begins whenever the parsed trial number OR the session
-        # changes. Trials are keyed by POSITION, not by number, so a reset/
-        # non-monotonic counter (e.g. ...30, 0, 1...) starts a new trial instead
-        # of merging into an earlier same-numbered trial; the session test also
-        # splits trials that share a number across two sessions.
-        if not trials or trial_num != prev_trial_num or session_index != prev_session:
+        if not trials or trial_num != prev_trial_num or sess_git != prev_sess_git:
             t = _make_empty_trial()
             t["Trial_number"] = trial_num
-            t["Session"] = session_index
             trials.append(t)
+            for _k in TICK_FIELDS:
+                trial_ticks[_k].append(0)
+            tnum_per_trial.append(trial_num)
+            sess_git_per_trial.append(sess_git)
+            # Any marker still waiting for a following trial resolves to this row.
+            row = len(trials) - 1
+            for k in range(len(marker_next_row)):
+                if marker_next_row[k] is None:
+                    marker_next_row[k] = row
         prev_trial_num = trial_num
-        prev_session = session_index
+        prev_sess_git = sess_git
 
         trial = trials[-1]
 
+        # First write wins for Start and End, and that is the write whose raw
+        # tick we keep: the window arithmetic is done in exact integers off
+        # these, because a subtraction in seconds at ~1.5e9 s would inherit
+        # ~238 ns of rounding from each operand.
+        was_nan = {k: _is_nan(trial[k]) for k in TICK_FIELDS}
+        before_undef = len(trial["undefined"])
         _dispatch_trial_event(event_text, time_s, trial)
+        for k in TICK_FIELDS:
+            if was_nan[k] and not _is_nan(trial[k]):
+                trial_ticks[k][-1] = int(tick)
+        n_undefined += len(trial["undefined"]) - before_undef
 
         # Update Save_complete after each event
         if not _is_nan(trial["Start"]) and trial["Start"] > 0:
             trial["Save_complete"] = 1
 
-    return experiments, trials
+    # ── Pass 2: Session labels from resets, then re-key the metadata ────────
+    session = _session_labels_from_resets(tnum_per_trial, sess_git_per_trial)
+    for t, s in zip(trials, session):
+        t["Session"] = s
+
+    experiments = _reindex_experiments(exp_by_marker, marker_next_row, session)
+
+    if n_undefined:
+        warnings.warn(
+            f"{n_undefined} comment(s) matched no known event and went to "
+            "trials.undefined.",
+            stacklevel=2,
+        )
+
+    return experiments, trials, trial_ticks

@@ -8,7 +8,41 @@ import re
 COMMENT_PREFIX_PRIMARY = "NSP"   # NSP-*.nev: comments + comment timing
 COMMENT_PREFIX_LEGACY = "HUB"    # HUB-*.nev: legacy fallback for comments
 SPIKE_PREFIX = "HUB"             # HUB-*.nev: online spike timing + waveforms
-ANALOG_PREFIX = "NSP"            # NSP-*.ns2: analog/eye data
+EYE_PREFIX = "NSP"               # NSP-*.ns2: eye data (+ photodiode by default)
+EYE_IDENTIFIER = "ns2"           # eye stream extension
+LFP_PREFIX = "Hub"               # Hub-*.ns2: local field potential
+LFP_IDENTIFIER = "ns2"           # LFP extension (mirrors EYE_IDENTIFIER)
+PHOTODIODE_PREFIX = "NSP"        # fallback/forced separate-file prefix
+PHOTODIODE_IDENTIFIER = "ns4"    # fallback/forced separate-file extension
+
+# ── Channel layout of the eye EYE_PREFIX-*.ns2 stream (1-based, as MATLAB) ──
+# The photodiode rides in the same file by default: eye signal on rows 1-3,
+# photodiode on rows 4-6. Kept 1-based so these line up with the MATLAB
+# properties; they are converted to 0-based only at the indexing site.
+EYE_CHANNELS = (1, 2, 3)
+PHOTODIODE_CHANNELS = (4, 5, 6)
+
+# ── Physical units of the continuous streams ───────────────────────────────
+# Each NSx extended header carries a Units string alongside the
+# MaxAnalogValue/MaxDigitalValue scale factor. NPMK's openNSx ignores it and
+# calls every scaled result "uV" (openNSx.m:1350), which is right for the LFP
+# (Units 'uV') but off by 1000x for the analog-input eye/photodiode channels
+# (Units 'mV'). We keep MATLAB's numbers and record what the unit actually is.
+UNIT_LABELS: dict[str, str] = {
+    "uV": "microVolts",
+    "µV": "microVolts",
+    "mV": "milliVolts",
+    "V": "Volts",
+}
+# Multiplier that takes a value in the header's unit to microVolts, for the
+# opt-in to_microvolts=True conversion.
+UNIT_TO_MICROVOLTS: dict[str, float] = {
+    "uV": 1.0,
+    "µV": 1.0,
+    "mV": 1e3,
+    "V": 1e6,
+}
+MICROVOLTS_LABEL = "microVolts"
 
 # Online-spike "unit" ids that are not sorted single units: 0 = unsorted
 # threshold crossings, 255 = noise/invalidated. Dropped unless include_unsorted=True.
@@ -20,6 +54,10 @@ UNSORTED_UNIT_IDS = (0, 255)
 SEGMENT_PRE_MS = 500
 SEGMENT_POST_MS = 500
 SEGMENT_BIN_MS = 1
+
+# Refractory window (ms) for info.ViolationRate: the fraction of a unit's ISIs
+# shorter than this over its full spike train.
+SPIKE_ISI_VIOLATION_MS = 1
 
 # ── Experiment-level event map ─────────────────────────────────────────────
 # Maps text tokens in "Experiment start/end:" lines → experiment struct fields
