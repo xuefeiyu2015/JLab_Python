@@ -31,3 +31,6 @@ build/
 *.ns4
 *.ns5
 *.ns6
+
+# Tests are local-only
+tests/

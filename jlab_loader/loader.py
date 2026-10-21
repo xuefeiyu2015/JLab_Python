@@ -4,13 +4,14 @@ BlackRockLoader — main user-facing class.
 Reads the role-split Blackrock files for one session and exports the same
 products as the MATLAB BlackrockLoader / BackRockFileLoader.m, with the same
 filenames minus the `_matlab` suffix:
-  NSP-*.nev  -> experiment comments + comment timing  (-> expmeta .txt, trials .csv)
+  HUB-*.nev  -> experiment comments + comment timing  (-> expmeta .txt, trials .csv)
   NSP-*.ns2  -> eye data (+ photodiode on ch 4-6)     (-> _eye.mat, _photodiode.mat)
   Hub-*.ns2  -> local field potential                 (-> _lfp.mat)
   HUB-*.nev  -> online spike timing                   (-> _spikes.mat)
   HUB-*.nev  -> online spike waveforms (opt-in)       (-> _spikes_waveform.mat)
-HUB-*.nev is also the legacy fallback for comments (early sessions wrote comments
-and spikes both to the HUB file).
+Comments and online spikes normally share the HUB-*.nev file. Exception: for a
+short window in mid-2026 comments were written to NSP-*.nev instead, so they
+fall back from HUB to NSP when the HUB file carries none.
 
 Precision rule, copied from the MATLAB class header: VOLTAGES are single, TIMES
 are always double. Segmented sample values, spike waveforms and the 0/1 raster
@@ -39,13 +40,24 @@ from . import _constants as C
 from ._continuous import (
     align_ptp_clock_drift,
     clamp_channels,
+    compute_alignment_report,
+    continuous_status,
+    empty_continuous_repair,
+    npmk_segment_count,
+    print_alignment_report,
+    repair_ptp_samples,
     segment_continuous,
     subset_channels,
 )
 from ._exporter import write_expmeta, write_trials_csv
 from ._features import compute_derived_features
 from ._matio import save_mat_v73
-from ._parser import parse_comments
+from ._parser import (
+    compute_parse_report,
+    parse_comments,
+    print_parse_report,
+    validate_event_maps,
+)
 from ._spikes import drop_units, segment_spikes
 from ._waveforms import segment_waveforms
 
@@ -202,6 +214,9 @@ class BlackRockLoader:
     ) -> None:
         self.session_path = Path(session_path)
         self.date = date
+        # Fail at construction on an event map that would drop comments silently.
+        validate_event_maps()
+
         self.date_str = date
         self.verbose = verbose
         self.data_folder = self.session_path / data_type / date
@@ -216,9 +231,9 @@ class BlackRockLoader:
         self.photodiode_use_separate_file = photodiode_use_separate_file
         self.to_microvolts = to_microvolts
 
-        # ── Comment .nev candidates (NSP primary, HUB legacy fallback) ────────
+        # ── Comment .nev candidates (HUB primary, NSP fallback) ──────────────
         # The comment source is finalised at load time (the first candidate that
-        # actually carries comments wins), matching MATLAB's NSP -> HUB fallback.
+        # actually carries comments wins), matching MATLAB's HUB -> NSP fallback.
         if nev_filename is not None:
             path = self.data_folder / nev_filename
             if not path.exists():
@@ -475,9 +490,11 @@ class BlackRockLoader:
         if self.verbose:
             print(f"Loading NEV: {source.name}  ({len(comments)} events)")
 
-        self.experiments, self.trials, self.trial_ticks = parse_comments(
+        self.experiments, self.trials, self.trial_ticks, parse_info = parse_comments(
             comments, times_s, ticks
         )
+        # Printed BEFORE the derived fields are added, as MATLAB parseEvents does.
+        print_parse_report(compute_parse_report(self.trials, parse_info))
         self.start_ticks = self.trial_ticks["Start"]
         self.end_ticks = self.trial_ticks["End"]
         self.comment_time_res = self._tick_rate
@@ -592,6 +609,7 @@ class BlackRockLoader:
                 for h in nsx.extended_headers
             }
             packets = self._read_nsx_packets(ns_path, nsx)
+            repair = empty_continuous_repair()
             if packets is not None:
                 data, stamps = packets
                 elec_ids = [h["ElectrodeID"] for h in nsx.extended_headers]
@@ -616,9 +634,30 @@ class BlackRockLoader:
 
         start_tick = int(stamps[0])
 
-        # Correct PTP clock drift exactly as NPMK's openNSx does, so both
-        # readers hand the segmenter the same sample stream.
-        data, n_added = align_ptp_clock_drift(data, stamps, samplingrate, tick_rate)
+        # Where NPMK would split this PTP file into segments, MATLAB re-reads it
+        # with 'nosegment' (no clock-drift alignment) and rebuilds the sample
+        # grid from the per-sample timestamps instead. Take the same branch.
+        n_segments = (
+            npmk_segment_count(stamps, samplingrate, tick_rate)
+            if packets is not None and tick_rate > 1e5
+            else 1
+        )
+        n_added = 0
+        if n_segments > 1:
+            print(
+                f"  WARNING: {ns_path.name} came back as {n_segments} data segments; "
+                "re-reading with 'nosegment' and rebuilding the sample grid."
+            )
+            data, repair = repair_ptp_samples(
+                data, stamps, samplingrate, tick_rate, segments=n_segments
+            )
+        else:
+            # Correct PTP clock drift exactly as NPMK's openNSx does, so both
+            # readers hand the segmenter the same sample stream.
+            data, n_added = align_ptp_clock_drift(data, stamps, samplingrate, tick_rate)
+        status = continuous_status(ns_path.name, repair)
+        if repair["segments"] or repair["applied"]:
+            print(f"  {status}")
         if n_added and self.verbose:
             verb = "Added" if n_added > 0 else "Removed"
             print(
@@ -628,7 +667,7 @@ class BlackRockLoader:
         n_samples = data.shape[1]
         # Reconstruct absolute sample time on the recording clock (same basis as
         # the comment/spike timestamps): start_tick / tick_rate + n / samp_per_s.
-        abs_time = start_tick / tick_rate + np.arange(n_samples) / samplingrate
+        abs_time = float(start_tick) / tick_rate + np.arange(n_samples) / samplingrate
         uv_per_digit = np.array(
             [factor.get(int(e), 1.0) for e in elec_ids], dtype=float
         )
@@ -664,6 +703,8 @@ class BlackRockLoader:
             "timeresolution": tick_rate,
             "elec_ids": elec_ids,
             "source": ns_path.name,
+            "repair": repair,
+            "status": status,
         }
         self.raw[role] = stream
 
@@ -1117,6 +1158,15 @@ class BlackRockLoader:
             except Exception as e:
                 print(f"  Spike loading failed: {e}")
 
+        # Reported AFTER the export, against the products actually written: a
+        # stream whose clock does not overlap the comment clock still exports,
+        # just with zero samples.
+        print_alignment_report(compute_alignment_report([
+            ("Eye", self.eye),
+            ("Photodiode", self.photodiode if self._want_photodiode else None),
+            ("LFP", self.lfp),
+        ]))
+
         return self.output_dir, filenames
 
     @classmethod
@@ -1297,7 +1347,7 @@ class BlackRockLoader:
 
     def _get_comments(self) -> tuple[list[str], list[float], list[int], Path]:
         """Return (comments, times_s, ticks, source_path) from the first comment
-        candidate that actually carries comments (NSP, then HUB legacy)."""
+        candidate that actually carries comments (HUB, then the NSP fallback)."""
         if not self._comment_candidates:
             raise FileNotFoundError(
                 f"No {C.COMMENT_PREFIX_PRIMARY}-*.nev or {C.COMMENT_PREFIX_LEGACY}-*.nev "
@@ -1358,7 +1408,9 @@ class BlackRockLoader:
                 deduped_comments.append(c)
                 deduped_ticks.append(int(t))
 
-        times_s = [t / self._tick_rate for t in deduped_ticks]
+        # double(tick) / TimeRes, as MATLAB's commentFields does. Dividing the
+        # exact int instead rounds differently in the last digit at ~1.5e18 ticks.
+        times_s = [float(t) / self._tick_rate for t in deduped_ticks]
         return deduped_comments, times_s, deduped_ticks
 
     def _read_online_spikes(

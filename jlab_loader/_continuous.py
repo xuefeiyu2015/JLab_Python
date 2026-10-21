@@ -129,6 +129,214 @@ def align_ptp_clock_drift(
     return data, added
 
 
+def npmk_segment_count(
+    timestamps: np.ndarray,
+    samplingrate: float,
+    time_res: float,
+    packets_per_frame: int = 100000,
+    max_tick_multiple: float = 2,
+) -> int:
+    """How many data segments NPMK's openNSx would split a PTP file into.
+
+    Port of the frame-based pause screen in openNSx.m (lines 842-905). The file
+    is walked in frames of ``packets_per_frame`` packets that overlap by one;
+    a frame whose elapsed time reaches ``(n-1)*tps + (M-1)*tps`` is searched,
+    and every within-frame step larger than ``M*tps`` opens a new segment.
+
+    MATLAB's loader re-reads a file with 'nosegment' (and repairs it, see
+    repair_ptp_samples) exactly when this is > 1, so the Python reader uses it
+    to take the same branch. Timestamps are compared as doubles, as fread
+    returns them in MATLAB -- at ~1.8e18 ns that is a 256 ns quantum.
+    """
+    ts = np.asarray(timestamps).ravel().astype(np.float64)
+    n = ts.size
+    if n < 2:
+        return 1
+    tps = time_res / samplingrate
+    min_pause = max_tick_multiple * tps
+    n_seg = 1
+    a = 0
+    while a < n - 1:
+        fn = min(packets_per_frame, n - a)
+        last = a + fn - 1
+        expected_min_pause = (fn - 1) * tps + (min_pause - tps)
+        if ts[last] - ts[a] >= expected_min_pause:
+            n_seg += int(np.count_nonzero(np.diff(ts[a : last + 1]) > min_pause))
+        a = last
+    return n_seg
+
+
+def empty_continuous_repair() -> dict:
+    """The "nothing was wrong with this stream" repair report.
+
+    Port of BlackrockLoader.emptyContinuousRepair.
+      segments   -- data segments NPMK reports before the 'nosegment' re-read
+                    (0 when the normal single-block read applies)
+      applied    -- True when the sample grid was actually rebuilt
+      stale      -- samples dropped for arriving out of chronological order
+      gaps       -- grid slots left NaN because no sample arrived on time
+      collisions -- survivors that landed on an already-occupied slot (last
+                    one wins)
+    """
+    return {"segments": 0, "applied": False, "stale": 0, "gaps": 0, "collisions": 0}
+
+
+def repair_ptp_samples(
+    data: np.ndarray,
+    timestamps: np.ndarray,
+    samplingrate: float,
+    time_res: float,
+    segments: int = 0,
+) -> tuple[np.ndarray, dict]:
+    """Rebuild a uniform sample grid from per-sample PTP timestamps.
+
+    Port of the "PTP sample-order repair" in BlackrockLoader.loadContinuous,
+    which runs only on the 'nosegment' path. Samples that arrived late sit out
+    of chronological order and carry values from tens or hundreds of ms
+    earlier; they are dropped (only forward-progressing timestamps are kept),
+    and the survivors are scattered onto the slot their own timestamp names,
+    leaving NaN wherever nothing arrived on time.
+
+    A clean stream comes back unchanged (still int16). A repaired one comes
+    back float32, because int16 cannot carry the NaN gaps; the uV scale still
+    applies unchanged downstream.
+    """
+    repair = empty_continuous_repair()
+    repair["segments"] = segments
+    ts = np.asarray(timestamps).ravel().astype(np.float64)
+    if ts.size == 0:
+        return data, repair
+
+    tps = time_res / samplingrate
+    keep = ts >= np.maximum.accumulate(ts)
+    # MATLAB round() is half away from zero; offsets are non-negative here.
+    grid_index = np.floor((ts[keep] - ts[0]) / tps + 0.5).astype(np.int64)
+    n_grid = int(grid_index[-1]) + 1
+    n_placed = int(np.unique(grid_index).size)
+
+    if np.all(keep) and n_grid == grid_index.size:
+        return data, repair
+
+    # Densifying a genuinely long pause would allocate a grid far larger than
+    # the data. Fail loudly rather than exhaust memory.
+    if n_grid > 2 * grid_index.size:
+        raise ValueError(
+            f"stream spans {n_grid} sample slots for only {grid_index.size} samples; "
+            "this looks like a real recorded pause, which cannot be represented "
+            "as one block."
+        )
+    out = np.full((data.shape[0], n_grid), np.nan, dtype=np.float32)
+    out[:, grid_index] = data[:, keep].astype(np.float32)
+
+    repair["applied"] = True
+    repair["stale"] = int(np.count_nonzero(~keep))
+    repair["gaps"] = n_grid - n_placed
+    repair["collisions"] = int(grid_index.size) - n_placed
+    return out, repair
+
+
+def continuous_status(file_name: str, repair: dict) -> str:
+    """Status line for one continuous stream (BlackrockLoader.continuousStatus).
+
+    A repaired stream says so: silently dropping ~1% of an eye trace is exactly
+    the kind of thing that must not pass unremarked.
+    """
+    if not repair["applied"]:
+        if repair["segments"] > 0:
+            return (
+                f"ok ({file_name}) [re-read with nosegment: "
+                f"{repair['segments']} segments]"
+            )
+        return f"ok ({file_name})"
+    seg_txt = f"{repair['segments']} segments, " if repair["segments"] > 0 else ""
+    return (
+        f"ok ({file_name}) [PTP repair: {seg_txt}{repair['stale']} stale samples "
+        f"dropped, {repair['gaps']} NaN gaps, {repair['collisions']} collisions]"
+    )
+
+
+def compute_alignment_report(products: list[tuple[str, dict | None]]) -> list[dict]:
+    """Per-product verdict on whether the trials overlap each continuous stream.
+
+    Pure. Port of BlackrockLoader.computeAlignmentReport. A product that is None
+    (never loaded) or carries no ``info.coverage`` is skipped -- "absent" must
+    not read as "misaligned".
+
+    status: 'ok' every trial segmented; 'short' some; 'error' none -- the
+    markers and the stream do not overlap at all.
+    """
+    rep = []
+    for name, prod in products:
+        if prod is None or "coverage" not in prod.get("info", {}):
+            continue
+        c = prod["info"]["coverage"]
+        if c["nSegmented"] == 0:
+            status = "error"
+        elif c["nSegmented"] < c["nTrials"]:
+            status = "short"
+        else:
+            status = "ok"
+        # Shortfall between the two intervals; 0 when they touch or overlap.
+        # max() over NaN candidates follows MATLAB, which skips NaN.
+        cands = [c["streamStart"] - c["markerLast"], c["markerFirst"] - c["streamEnd"], 0.0]
+        gap = max(v for v in cands if not math.isnan(v))
+        rep.append({
+            "name": name, "status": status,
+            "nSegmented": c["nSegmented"], "nTrials": c["nTrials"],
+            "streamStart": c["streamStart"], "streamEnd": c["streamEnd"],
+            "markerFirst": c["markerFirst"], "markerLast": c["markerLast"],
+            "gap": gap,
+        })
+    return rep
+
+
+def print_alignment_report(rep: list[dict]) -> None:
+    """Render a compute_alignment_report() result (BlackrockLoader.printAlignmentReport).
+
+    Also warns once per misaligned product, so a batch log carries it after
+    the block has scrolled past. Not an error: the trials table and the spikes
+    come from a different file and are still good.
+    """
+    if not rep:
+        return
+    print("\n--- Export alignment check (trials vs continuous streams) ---")
+    for r in rep:
+        print(
+            f"  {r['name'] + ':':<12s} {r['status'].upper():<6s} "
+            f"{int(r['nSegmented'])}/{int(r['nTrials'])} trials segmented"
+        )
+        if r["status"] == "ok":
+            continue
+        print(f"       stream  [{r['streamStart']:.3f} .. {r['streamEnd']:.3f}]")
+        print(f"       markers [{r['markerFirst']:.3f} .. {r['markerLast']:.3f}]")
+        if r["gap"] > 0:
+            late = "stream clock is BEHIND the comment clock"
+            if r["markerFirst"] > r["streamEnd"]:
+                late = "comment clock is AHEAD of the stream clock"
+            print(
+                f"       the two do not overlap: gap {r['gap']:.3f} s "
+                f"({r['gap'] / 86400:.2f} days) -- {late}"
+            )
+        if r["status"] == "error":
+            print(
+                "       NOTHING was segmented: this product exports with zero samples,\n"
+                "       and any analysis that aligns to it will fail on an empty time base."
+            )
+            warnings.warn(
+                f"{r['name']}: no trial overlaps the continuous stream "
+                f"(0/{int(r['nTrials'])} segmented, gap {r['gap']:.1f} s). "
+                f"The exported {r['name']} product has zero samples.",
+                stacklevel=2,
+            )
+        else:
+            warnings.warn(
+                f"{r['name']}: only {int(r['nSegmented'])} of {int(r['nTrials'])} "
+                "trials overlap the continuous stream.",
+                stacklevel=2,
+            )
+    print("-------------------------------------------------------------")
+
+
 def clamp_channels(rows, n_chan: int, name: str) -> np.ndarray:
     """Drop requested (1-based) channel rows the stream does not actually have.
 
@@ -231,7 +439,7 @@ def segment_continuous(
     dict mirroring the MATLAB ``A`` struct:
         "data"     : (nChan, nTrials, maxSamples) float32, NaN-padded
         "timeseq"  : {"alignedrawtime", "aligned_marker", "relative_time"}
-        "info"     : {"samplingrate", "Session", "Trial_number"[, "Unit"]}
+        "info"     : {"samplingrate", "Session", "Trial_number", "coverage"[, "Unit"]}
     """
     pre = pre_ms / 1000.0
     post = post_ms / 1000.0
@@ -346,6 +554,19 @@ def segment_continuous(
     # the one deliberate addition to that schema.
     if unit is not None:
         info["Unit"] = unit
+
+    # Alignment evidence, carried WITH the product: this is the only place that
+    # sees both clocks, and the raw stream is released right after. Pure
+    # bookkeeping -- nothing here changes what is segmented. Doubles, as MATLAB.
+    ok_starts = starts[ok]
+    info["coverage"] = {
+        "nTrials": float(n_trials),
+        "nSegmented": float(np.count_nonzero(n > 0)),
+        "streamStart": float(t_ref),
+        "streamEnd": float(t_ref + (n_sample - 1) / nsx_samplingrate),
+        "markerFirst": float(ok_starts.min()) if ok_starts.size else math.nan,
+        "markerLast": float(ok_starts.max()) if ok_starts.size else math.nan,
+    }
 
     return {
         "data": data,  # nChan x nTrials x maxSamples, NaN-padded, float32
