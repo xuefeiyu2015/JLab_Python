@@ -8,7 +8,6 @@ Both reproduce what MATLAB's prepareExport + export produce, byte for byte.
 
 from __future__ import annotations
 
-import csv
 import math
 from pathlib import Path
 
@@ -22,7 +21,7 @@ def _build_column_order() -> list[str]:
 
     MATLAB builds this table in three steps (BlackrockLoader.m:1300-1318):
       1. struct2table over the template order, minus undefined/duplicates,
-         with the 7 derived fields already appended by addDerivedTrialFeatures;
+         with the derived fields already appended by addDerivedTrialFeatures;
       2. an explicit 0-based `index` column inserted at the front;
       3. every 2-column numeric field split into <name>_x / <name>_y.
 
@@ -88,6 +87,19 @@ def _mat2str(val) -> str:
     return str(val)
 
 
+# Experiment fields that MATLAB grows as COLUMN vectors (pause_times(end+1,1)),
+# so mat2str prints them '[]', a bare scalar, or '[a;b]'.
+_COLUMN_VECTOR_FIELDS = {"pause_times", "resume_times"}
+
+
+def _mat2str_column(vals) -> str:
+    """mat2str() of a numeric column vector: '[]', 'a', or '[a;b;...]'."""
+    parts = [_mat2str(v) for v in vals]
+    if len(parts) == 1:
+        return parts[0]
+    return "[" + ";".join(parts) + "]"
+
+
 def _csv_value(val, text_column: bool) -> str:
     """Serialise one trial field for CSV output.
 
@@ -119,6 +131,24 @@ def _text_columns(rows: list[dict]) -> set[str]:
     return text
 
 
+def _quoted_columns(rows: list[dict], text_cols: set[str]) -> set[str]:
+    """Text columns writetable quotes with 'QuoteStrings','minimal'.
+
+    The decision is per COLUMN, not per cell: once any value in a text column
+    contains the delimiter, a double quote or a line break, MATLAB quotes every
+    string in that column (so 'white' comes out as "white" next to
+    "[-0.8, -0.8, -0.8]"). Missing values and empty strings stay empty.
+    """
+    quoted: set[str] = set()
+    for c in text_cols:
+        for row in rows:
+            v = row.get(c)
+            if isinstance(v, str) and any(ch in v for ch in ',"\n\r'):
+                quoted.add(c)
+                break
+    return quoted
+
+
 # ── Public writers ─────────────────────────────────────────────────────────
 
 def write_expmeta(experiments: list[dict], path: Path) -> None:
@@ -135,7 +165,10 @@ def write_expmeta(experiments: list[dict], path: Path) -> None:
         for s, experiment in enumerate(experiments, start=1):
             fid.write(f"Session {s}:\n")
             for field, val in experiment.items():
-                fid.write(f"{field}: {_mat2str(val)}\n")
+                text = (
+                    _mat2str_column(val) if field in _COLUMN_VECTOR_FIELDS else _mat2str(val)
+                )
+                fid.write(f"{field}: {text}\n")
             fid.write("\n")
 
 
@@ -176,10 +209,17 @@ def write_trials_csv(trials: list[dict], path: Path) -> None:
     extra = [c for c in raw_rows[0] if c not in known]
     columns = [c for c in _COLUMN_ORDER if c in raw_rows[0]] + extra
 
+    quoted = _quoted_columns(raw_rows, text_cols)
+
+    # LF line endings, as writetable writes them (csv.writer defaults to CRLF).
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(columns)
+        f.write(",".join(columns) + "\n")
         for row in raw_rows:
-            writer.writerow(
-                [_csv_value(row.get(c), c in text_cols) for c in columns]
-            )
+            cells = []
+            for c in columns:
+                val = row.get(c)
+                cell = _csv_value(val, c in text_cols)
+                if c in quoted and isinstance(val, str) and val:
+                    cell = '"' + cell.replace('"', '""') + '"'
+                cells.append(cell)
+            f.write(",".join(cells) + "\n")

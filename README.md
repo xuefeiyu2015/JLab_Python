@@ -3,7 +3,7 @@
 Python package for loading and exporting Blackrock NEV/NSx data from JLab experiments.
 Replicates the output of `BackRockFileLoader.m` / `BlackrockLoader.m` [Matlab Version](https://github.com/xuefeiyu2015/JLab) — same parsing schema, segmentation, and output products.
 
-Last update: Xuefei Yu, 08-05-2026
+Last update: Xuefei Yu, 10-21-2026
 
 
 ## What it does
@@ -11,10 +11,12 @@ Last update: Xuefei Yu, 08-05-2026
 A session is split across files by **filename prefix**, and the loader picks each
 file by its role (mirroring the MATLAB `BlackrockLoader`):
 
-- `NSP-*.nev` → behavioral trial event comments, parsed into a trial-based structure
+- `HUB-*.nev` → behavioral trial event comments, parsed into a trial-based structure
+  (falls back to `NSP-*.nev` when the HUB file carries no comments — a brief mid-2026 window
+  wrote them there)
 - `NSP-*.ns2` → eye data (channels 1-3) and the photodiode (channels 4-6), segmented per trial
 - `Hub-*.ns2` → local field potential, segmented per trial
-- `HUB-*.nev` → online spike timing, rasterized per trial (also the **legacy fallback** for comments)
+- `HUB-*.nev` → online spike timing, rasterized per trial
 - `HUB-*.nev` → online spike **waveforms**, segmented per trial (opt-in `load_online_wave=True`)
 
 Outputs (written to `export_data/<Date>/`) — the same contents as the MATLAB loader, with
@@ -139,6 +141,14 @@ drops the file's last packet. `jlab_loader` reads the PTP packets directly and a
 same drift correction, so both readers hand the segmenter the same sample stream; without
 this every trial after the first correction point would be off by one sample.
 
+When a PTP stream's timestamps glitch badly enough that NPMK would split it into segments
+(its frame-based pause screen, reproduced in `npmk_segment_count`), the MATLAB loader
+re-reads it with `'nosegment'` and rebuilds the sample grid from the per-sample timestamps.
+`jlab_loader` takes the same branch: late, out-of-order samples are dropped, the rest are
+placed on the slot their timestamp names, and empty slots stay NaN (the stream becomes
+`float32`). The load prints a status line such as
+`ok (NSP-....ns2) [PTP repair: 312 segments, 41 stale samples dropped, 40 NaN gaps, 0 collisions]`.
+
 ## Reading the products back
 
 ```python
@@ -220,10 +230,10 @@ Your data must be laid out like this:
     └── <Location>/                 ← this is the "session path"
         ├── raw_data/
         │   └── <Date>/             ← e.g. 2026-06-17
-        │       ├── NSP-*.nev       ← behavioral events (largest NSP-* is auto-picked)
+        │       ├── HUB-*.nev       ← behavioral events + optional online spikes (largest is auto-picked)
+        │       ├── NSP-*.nev       ← comment fallback (mid-2026 sessions only)
         │       ├── NSP-*.ns2       ← optional eye (ch 1-3) + photodiode (ch 4-6)
-        │       ├── Hub-*.ns2       ← optional LFP
-        │       └── HUB-*.nev       ← optional online spikes (legacy comment fallback)
+        │       └── Hub-*.ns2       ← optional LFP
         └── export_data/            ← created automatically
             └── <Date>/
                 ├── Blackrock_<Date>_expmeta.txt
@@ -447,7 +457,13 @@ eyetracker_rate: 1000
 eye_tracked: right
 start: 1772321423.977
 end: 1772321687.412
+end_by: experimenter closed task
+pause_times: [1772321500.1;1772321610.4]
+resume_times: 1772321530.2
 ```
+`pause_times` / `resume_times` come from `Experiment paused` / `Experiment resumed` lines and
+are printed as MATLAB column vectors: `[]` when the session never paused, a bare number for
+one, `[a;b]` for several.
 
 ### `_trials.csv`
 One row per trial. Key columns:
@@ -458,11 +474,21 @@ One row per trial. Key columns:
 | `Task` | Task name (e.g. `time_delay_experiment`) |
 | `Trialoutcome` | Behavioral outcome |
 | `Save_complete` | 1 if trial data is complete |
-| `Target_1_angle`, `Target_2_angle` | Target polar angle (degrees, 0° = up, clockwise) |
-| `Target_1_ecc`, `Target_2_ecc` | Target eccentricity (degrees) |
-| `Stimulus_direction` | +1 or −1 |
+| `Target_1_theta`, `Target_2_theta` | Target polar angle (deg) in the task's convention: 0° = right (+x), counter-clockwise, `[0, 360)`. Taken from a `Target N position polar` comment when the task sends one, else computed from the cartesian position |
+| `Target_1_rho`, `Target_2_rho` | Target eccentricity (deg), same sourcing as theta |
+| `Target_N_base_theta`, `Target_N_base_rho` | Pre-jitter base position (never back-computed) |
+| `Requested_jitter_theta[_step]`, `Requested_jitter_rho[_step]` | Jitter applied to the base position, and its grid |
+| `Target_1_dimmed` | Event time (s) of the `Target 1 dimmed` comment |
+| `Stimulus_direction` | Hemifield of target 1: +1 right (`theta <= 90 or theta > 270`), −1 left |
 | `Choose_target` | Which target was chosen (1 or 2) |
 | `Choose_leftright` | 1 = rightward, −1 = leftward |
+
+The theta columns replace the old `Target_N_angle` (0° = up, clockwise) and
+`Target_N_eccentricity` columns. Use `jlab_loader._features.hemifield` for left/right — a
+sign test no longer works in `[0, 360)`. Re-export older sessions rather than mixing frames.
+
+Color columns (`Fixation_color`, `Target_N_color`) keep the value verbatim, including the
+bracketed RGB form (`"[-0.8, -0.8, -0.8]"`, quoted in the CSV).
 
 ### `_eye.mat`, `_photodiode.mat`, `_lfp.mat`
 A continuous stream segmented into trials. MATLAB structs `eye`, `photodiode` and `lfp`,
@@ -476,6 +502,7 @@ all with the same layout:
 | `timeseq.relative_time` | samples | seconds from the `Start` marker (negative through the pre-buffer) |
 | `info.samplingrate` | — | sampling rate (Hz) |
 | `info.Session`, `info.Trial_number` | trials | per-trial session index / trial number |
+| `info.coverage` | — | alignment evidence: `nTrials`, `nSegmented`, `streamStart`/`streamEnd`, `markerFirst`/`markerLast` (s). `run()` prints an alignment check from it after export |
 | `info.Unit` | — | the samples' real physical unit, e.g. `"milliVolts"` (eye/photodiode) or `"microVolts"` (LFP). Not present in MATLAB's struct — see "A note on units" |
 
 `eye` rows are `eye_channels` of the source `.ns2` (1-3 by default) and `photodiode` rows
@@ -574,7 +601,7 @@ JLab_Python/
 ├── jlab_loader/
 │   ├── loader.py        # BlackRockLoader — main user-facing class
 │   ├── _parser.py       # event comment parsing
-│   ├── _features.py     # derived feature computation (angles, eccentricity)
+│   ├── _features.py     # derived feature computation (target theta/rho, hemifield, choice)
 │   ├── _exporter.py     # writes .txt and .csv files
 │   ├── _continuous.py   # segment_continuous — eye/LFP/photodiode → per-trial 3D array,
 │   │                    #   plus the NPMK PTP clock-drift alignment

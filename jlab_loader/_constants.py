@@ -5,8 +5,11 @@ import re
 # ── File role schema (mirrors BlackrockLoader.m properties) ────────────────
 # One session is split across files by filename prefix; the loader picks each
 # file by its prefix and verifies the expected data is present before using it.
-COMMENT_PREFIX_PRIMARY = "NSP"   # NSP-*.nev: comments + comment timing
-COMMENT_PREFIX_LEGACY = "HUB"    # HUB-*.nev: legacy fallback for comments
+COMMENT_PREFIX_PRIMARY = "HUB"   # HUB-*.nev: comments + comment timing
+# NSP-*.nev: fallback. A brief mid-2026 window wrote comments here instead;
+# "_LEGACY" names the ROLE (second in line), not the age -- those files are
+# NEWER than the HUB ones it falls back from.
+COMMENT_PREFIX_LEGACY = "NSP"
 SPIKE_PREFIX = "HUB"             # HUB-*.nev: online spike timing + waveforms
 EYE_PREFIX = "NSP"               # NSP-*.ns2: eye data (+ photodiode by default)
 EYE_IDENTIFIER = "ns2"           # eye stream extension
@@ -73,7 +76,7 @@ EXP_EVENTS: dict[str, str] = {
 
 # ── Trial event maps ───────────────────────────────────────────────────────
 # Each maps a substring of an event comment → trial struct field name.
-# Priority order during dispatch: TIME → INFO → SEGMENT → DASH → OUTCOME
+# Priority order during dispatch: POLAR → TIME → INFO → SEGMENT → DASH → OUTCOME
 
 TIME_EVENTS: dict[str, str] = {
     "Start": "Start",
@@ -92,6 +95,7 @@ TIME_EVENTS: dict[str, str] = {
     "Feedback flash off": "Feedback_flash_off",
     "Fixation exited": "Fixation_exited",
     "Target deadline exceeded": "Target_deadline_exceeded",
+    "Target 1 dimmed": "Target_1_dimmed",
 }
 
 SEGMENT_EVENTS: dict[str, str] = {
@@ -132,6 +136,22 @@ INFORMATION_EVENTS: dict[str, str] = {
     "Requested feedback flash duration": "Requested_feedback_flash_duration",
     "Requested choice timeout": "Requested_choice_timeout",
     "Requested target reach deadline": "Requested_target_reach_deadline",
+    "Requested jitter theta": "Requested_jitter_theta",
+    "Requested jitter theta step": "Requested_jitter_theta_step",
+    "Requested jitter rho": "Requested_jitter_rho",
+    "Requested jitter rho step": "Requested_jitter_rho_step",
+}
+
+# Polar coordinate pairs: "<name> (theta <t>, rho <r>) deg". The value is a
+# (theta_field, rho_field) PAIR, because one such comment carries two values.
+# theta is stored exactly as the task sends it (0 = +x, counter-clockwise,
+# [0, 360)). Checked before INFORMATION_EVENTS: "Target 1 position polar"
+# contains the information key "Target 1 position".
+POLAR_EVENTS: dict[str, tuple[str, str]] = {
+    "Target 1 position polar": ("Target_1_theta", "Target_1_rho"),
+    "Target 2 position polar": ("Target_2_theta", "Target_2_rho"),
+    "Requested target 1 base position polar": ("Target_1_base_theta", "Target_1_base_rho"),
+    "Requested target 2 base position polar": ("Target_2_base_theta", "Target_2_base_rho"),
 }
 
 DASH_EVENTS: list[str] = ["End", "Correct choice", "Wrong choice"]
@@ -141,10 +161,18 @@ OUTCOME_EVENTS: list[str] = ["Correct choice", "No choice", "Wrong choice"]
 COORD_FIELDS: set[str] = {"Fixation_position", "Target_1_position", "Target_2_position"}
 
 # ── Compiled regex patterns (mirrors BackRockFileLoader.m) ─────────────────
-RE_EXP = re.compile(r"^Experiment (start|end):\s*(.+)$")
+# "(.*)" not "(.+)": the text is trimmed first, so a bare "Experiment end:"
+# must still match or the session end timestamp is lost.
+RE_EXP = re.compile(r"^Experiment (start|end):\s*(.*)$")
+# "paused"/"resumed" carry no metadata token and are written WITHOUT the colon.
+# A separate pattern, so "Experiment ended by ..." never reads as an end marker.
+RE_EXP_PAUSE = re.compile(r"^Experiment (paused|resumed)\b:?\s*(.*)$")
 RE_TRIAL = re.compile(r"^Trial\s+(\d+):\s*(.*)$")
 RE_COORD = re.compile(
     r"^(.*?)\s*\(\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\)\s*deg$"
+)
+RE_POLAR = re.compile(
+    r"^(.*?)\s*\(\s*theta\s*([-+]?\d*\.?\d+)\s*,\s*rho\s*([-+]?\d*\.?\d+)\s*\)\s*deg$"
 )
 RE_REWARD = re.compile(r"^(.*?)\s*\(([\d\.]+)ms")
 # Value may be a number or 'None'/'none' (e.g. "... reach deadline None ms" → NaN)
